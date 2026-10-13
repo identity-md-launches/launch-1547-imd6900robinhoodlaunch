@@ -108,7 +108,10 @@ contract RobinhoodForkTest is Test {
     }
 
     function test_TheWholeLaunchOnRobinhood() public {
-        if (!live) return;
+        if (!live) {
+            vm.skip(true);
+            return;
+        }
         uint256 b1 = IMDSTR.balanceOf(H1);
         uint256 b2 = IMDSTR.balanceOf(H2);
         bytes32 l1 = keccak256(bytes.concat(keccak256(abi.encode(H1, b1))));
