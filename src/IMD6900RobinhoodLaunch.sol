@@ -379,9 +379,9 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     }
 
     /// @notice Sells `amount` (all of it with 0) of the coins held for the timelock back into the pool, the ETH to
-    ///         `to`: how the opening buy's ETH comes back (all of it but the pool's fee both ways, at the price the
-    ///         market left; the buy's fee comes back through the split). Behind the timelock's delay; `minEth` is the
-    ///         floor. What the pool can't take stays held.
+    ///         `to`: how the opening buy's ETH comes back, at the price the market left. Fee-free (the locked pool refunds
+    ///         it, IMD6900LockedPool.feeRefund); the opening buy's own fee went to the split. Behind the timelock's delay;
+    ///         `minEth` is the floor. What the pool can't take stays held.
     function sellHeld(uint256 amount, uint256 minEth, address to) external nonReentrant returns (uint256 eth) {
         if (msg.sender != timelock) revert NotTimelock();
         if (amount == 0) amount = excessHeld;
@@ -489,13 +489,25 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         if (msg.sender != address(poolManager)) revert OnlyPoolManager();
         (uint8 what, uint256 spend) = abi.decode(data, (uint8, uint256));
         if (what == 2) {
+            // fee-free: the locked pool hands each swap's fee (paid in the coin) straight back, and what comes back is
+            // sold again, three rounds (what is left, 4.44% cubed of it, stays held)
             PoolKey memory k = pool.poolKey();
-            BalanceDelta s = poolManager.swap(k, SwapParams(false, -int256(spend), TickMath.MAX_SQRT_PRICE - 1), "");
-            uint256 sold = uint256(uint128(-s.amount1()));
-            uint256 ethOut = uint256(uint128(s.amount0()));
-            poolManager.sync(k.currency1);
-            SafeTransferLib.safeTransfer(token, address(poolManager), sold);
-            poolManager.settle();
+            uint256 left = spend;
+            uint256 ethOut;
+            uint256 sold;
+            for (uint256 i; i < 3 && left != 0; ++i) {
+                pool.feeCheckpoint();
+                BalanceDelta s = poolManager.swap(k, SwapParams(false, -int256(left), TickMath.MAX_SQRT_PRICE - 1), "");
+                (, uint256 back) = pool.feeRefund(address(this));
+                uint256 paid = uint256(uint128(-s.amount1()));
+                ethOut += uint256(uint128(s.amount0()));
+                poolManager.sync(k.currency1);
+                SafeTransferLib.safeTransfer(token, address(poolManager), paid);
+                poolManager.settle();
+                sold += paid - back;
+                if (paid < left) break; // the pool took what it could
+                left = back;
+            }
             poolManager.take(k.currency0, address(this), ethOut);
             return abi.encode(ethOut, sold);
         }

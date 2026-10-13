@@ -34,13 +34,18 @@ interface IPerpsWiring {
 ///         here. There is no owner and no function that takes liquidity out to anyone: what is in the pool stays in a
 ///         pool. Two things happen to it:
 ///          - {collect} (anyone): the fee the position earns comes out, its ETH to the launch's fee split (the NFT
-///            pot and $IMD's burn), its IMD6900 burned;
+///            pot and $IMD's burn), its IMD6900 burned (or where the timelock points it, {setCoinFeeTo});
 ///          - {lowerFee} (the Robinhood timelock, behind its delay): the pool's fee is static (that is what keeps
 ///            Uniswap's routing automatic), so a lower fee is a new pool. This moves the position, in one unlock, from
 ///            the current pool into a fresh one at the lower fee and the same price: the two legs settle against each
 ///            other, nothing is paid out but the old pool's earned fees (to the split and the burn), and the fee can
 ///            only ever go down. Never while the perps engine has positions open: the engine is bound to its pool
 ///            for good, so they could no longer close; after a move it fails closed until a new one is wired.
+///         And one exemption, by refund: the hook's perps engine and the launch (its timelock's sale of held coins)
+///         trade fee-free. Inside its own swap a refunded caller calls {feeCheckpoint} just before and {feeRefund}
+///         just after: this contract owns all of the pool's liquidity, so the fees earned between the two are that
+///         swap's, to the wei, and they go straight back. The pool's fee stays static for everyone else (no dynamic
+///         fee, no deltas: Uniswap's routing is unaffected).
 contract IMD6900LockedPool is ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -50,6 +55,8 @@ contract IMD6900LockedPool is ReentrancyGuard {
     uint8 internal constant OPEN = 0;
     uint8 internal constant COLLECT = 1;
     uint8 internal constant MOVE = 2;
+    /// @dev Transient: a refunded caller's open checkpoint in this transaction, one slot per caller
+    bytes32 internal constant CHECKPOINT_SEED = keccak256("IMD6900LockedPool.checkpoint");
 
     IPoolManager public immutable poolManager;
     /// @notice IMD6900RobinhoodLaunch: sets the hook once, opens the pool once, and takes the ETH fees
@@ -66,11 +73,15 @@ contract IMD6900LockedPool is ReentrancyGuard {
     int24 public upperTick;
     /// @notice The position's liquidity
     uint128 public liquidity;
+    /// @notice Where the fee paid in IMD6900 goes: burned (zero, the default) unless the timelock points it elsewhere
+    address public coinFeeTo;
 
     event HookSet(address hook);
     event Opened(uint160 sqrtPriceX96, int24 upperTick, uint256 tokens, uint128 liquidity);
     event Collected(uint256 eth, uint256 tokensBurned);
     event FeeLowered(uint24 from, uint24 to, PoolId pool, uint128 liquidity);
+    event FeeRefunded(address indexed caller, address to, uint256 eth, uint256 tokens);
+    event CoinFeeToSet(address to);
 
     error OnlyLauncher();
     error OnlyTimelock();
@@ -84,6 +95,8 @@ contract IMD6900LockedPool is ReentrancyGuard {
     error NotLower();
     /// @notice The perps engine has positions open: its pool is fixed for good, so moving the liquidity would strand them
     error PerpsOpen();
+    error NotRefunded();
+    error NoCheckpoint();
 
     constructor(IPoolManager poolManager_, uint24 fee_, address launcher_, address timelock_) {
         poolManager = poolManager_;
@@ -155,12 +168,17 @@ contract IMD6900LockedPool is ReentrancyGuard {
         uint24 from = fee;
         fee = newFee;
         poolManager.initialize(poolKey(), sqrtPriceX96); // the hook serves the new pool from here on
-        uint256 eth;
-        uint256 tokens;
-        (eth, tokens, liq) = abi.decode(poolManager.unlock(abi.encode(MOVE, old)), (uint256, uint256, uint128));
+        (,, liq) = abi.decode(poolManager.unlock(abi.encode(MOVE, old)), (uint256, uint256, uint128));
         liquidity = liq;
-        _payOut(eth, tokens);
+        _payOutHeld(); // the old pool's earned fees, with anything checkpoints booked
         emit FeeLowered(from, newFee, poolKey().toId(), liq);
+    }
+
+    /// @notice Where the fee paid in IMD6900 goes from now on: zero burns it (the default)
+    function setCoinFeeTo(address to) external {
+        if (msg.sender != timelock) revert OnlyTimelock();
+        coinFeeTo = to;
+        emit CoinFeeToSet(to);
     }
 
     /*                               ANYONE                                 */
@@ -168,8 +186,42 @@ contract IMD6900LockedPool is ReentrancyGuard {
     /// @notice Collects the fees the position has earned: the ETH to the launcher's fee split, the IMD6900 burned
     function collect() external nonReentrant returns (uint256 eth, uint256 tokens) {
         if (token == address(0)) revert NotOpen();
-        (eth, tokens) = abi.decode(poolManager.unlock(abi.encode(COLLECT, uint128(0))), (uint256, uint256));
-        _payOut(eth, tokens);
+        poolManager.unlock(abi.encode(COLLECT, uint128(0)));
+        return _payOutHeld(); // with what fee checkpoints booked since the last collect
+    }
+
+    /*                          REFUNDED CALLERS                            */
+
+    /// @notice Who trades in the pool fee-free: the hook's perps engine, and the launch (its timelock's sale of held
+    ///         coins back into the pool)
+    function isRefunded(address a) public view returns (bool) {
+        return a == launcher || (a != address(0) && a == IPerpsWiring(hook).perpEngine());
+    }
+
+    /// @notice A refunded caller, inside its own PoolManager unlock, just before its swap: books every fee the position
+    ///         has earned so far (it is paid out at the next collect, like any), so {feeRefund} just after hands back
+    ///         exactly what that swap paid
+    function feeCheckpoint() external {
+        if (!isRefunded(msg.sender)) revert NotRefunded();
+        _poke(address(this));
+        bytes32 slot = _checkpointSlot(msg.sender);
+        assembly ("memory-safe") {
+            tstore(slot, 1)
+        }
+    }
+
+    /// @notice Just after the swap: the fees the position earned since the caller's {feeCheckpoint}, to `to`. Once per
+    ///         checkpoint, from the same caller, in the same transaction.
+    function feeRefund(address to) external returns (uint256 eth, uint256 tokens) {
+        bytes32 slot = _checkpointSlot(msg.sender);
+        uint256 armed;
+        assembly ("memory-safe") {
+            armed := tload(slot)
+            tstore(slot, 0)
+        }
+        if (armed == 0) revert NoCheckpoint();
+        (eth, tokens) = _poke(to);
+        emit FeeRefunded(msg.sender, to, eth, tokens);
     }
 
     /// @notice The pool's price and in-range liquidity
@@ -252,10 +304,32 @@ contract IMD6900LockedPool is ReentrancyGuard {
         return l > type(uint128).max ? type(uint128).max : uint128(l);
     }
 
-    function _payOut(uint256 eth, uint256 tokens) internal {
+    /// @dev Everything this contract holds is fees (it never keeps liquidity outside the pool): ETH to the launch's
+    ///      split, IMD6900 burned or to {coinFeeTo}
+    function _payOutHeld() internal returns (uint256 eth, uint256 tokens) {
+        eth = address(this).balance;
+        tokens = SafeTransferLib.balanceOf(token, address(this));
         if (eth != 0) IFeeSink(launcher).addFees{value: eth}();
-        if (tokens != 0) IBurnable(token).burn(tokens);
+        if (tokens != 0) {
+            address to = coinFeeTo;
+            if (to == address(0)) IBurnable(token).burn(tokens);
+            else SafeTransferLib.safeTransfer(token, to, tokens);
+        }
         emit Collected(eth, tokens);
+    }
+
+    /// @dev Inside the caller's unlock: the position's fees so far, taken to `to`
+    function _poke(address to) internal returns (uint256 eth, uint256 tokens) {
+        PoolKey memory key = poolKey();
+        (BalanceDelta d,) = _modifyLiquidity(key, 0);
+        eth = uint256(uint128(d.amount0()));
+        tokens = uint256(uint128(d.amount1()));
+        if (eth != 0) poolManager.take(key.currency0, to, eth);
+        if (tokens != 0) poolManager.take(key.currency1, to, tokens);
+    }
+
+    function _checkpointSlot(address a) internal pure returns (bytes32) {
+        return keccak256(abi.encode(CHECKPOINT_SEED, a));
     }
 
     function _abs(int128 v) internal pure returns (uint256) {

@@ -9,9 +9,9 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
 
 | | |
 |---|---|
-| `src/IMD6900RobinhoodLaunch.sol` | What the swarm deploys. Its constructor creates the locked pool and calls nothing that existed before it (~6.4M gas, the same from any deployer). `createHook(salt)` (anyone, once) then creates the hook at a salt mined off-chain for its address. Then the launch, the claims, the fee split. |
+| `src/IMD6900RobinhoodLaunch.sol` | What the swarm deploys. Its constructor creates the locked pool and calls nothing that existed before it (~6.9M gas, the same from any deployer). `createHook(salt)` (anyone, once) then creates the hook at a salt mined off-chain for its address. Then the launch, the claims, the fee split. |
 | `src/IMD6900.sol` | The coin: 1B minted once to the launch. No owner, no mint, no tax, no pause, no blacklist, no limits, no proxy. Holders can burn their own. |
-| `src/IMD6900LockedPool.sol` | Owns the pool's one position. No owner, no way to take liquidity out. `collect()` (anyone): ETH fees to the split, IMD6900 fees burned. `lowerFee(fee)` (the timelock only, lower only): moves the position, in one transaction, into a new pool at the lower fee and the same price. |
+| `src/IMD6900LockedPool.sol` | Owns the pool's one position. No owner, no way to take liquidity out. `collect()` (anyone): ETH fees to the split, IMD6900 fees burned (or to `setCoinFeeTo`'s address). `lowerFee(fee)` (the timelock only, lower only, never with perps open): moves the position, in one transaction, into a new pool at the lower fee and the same price. `feeCheckpoint()` / `feeRefund(to)`: the perps engine and the launch's sale trade fee-free (below). |
 | `src/IMD6900Hook.sol` | ETH / IMD6900 only, at the locked pool's static fee, initialized by the locked pool only (at the launch, and at each lower fee it moves to), liquidity from it only. Charges nothing itself: no dynamic fee, no return deltas. In-pool perps: before every swap that isn't the engine's own, the engine (once the timelock wires one) liquidates every position the swap would sink, at the price before it moves; a best-effort second sweep after. Reports the pool's fee to the engine (`perpFeeBps`). Not upgradeable. Owned by the Robinhood timelock. |
 
 ## The launch, one transaction
@@ -34,8 +34,10 @@ executor `0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07`, fixed in the code, which 
 team. The fee paid in IMD6900 (on sells) is burned: the pot bridge carries ETH only. The perps engine's fees (its open fee
 and liquidation penalties, after its stakers' 20% and insurance's 10%, both editable in the engine) come in through
 `addPerpFees()` and go on, all of it, as ETH to the pot bridge. Every landing address is the timelock's to change: the
-split's payees and shares (`setPayees`), the perps fees' (`setPerpFeeTo`), IMD's burn executor (`setImdBurn`, the
-canonical one by default), $IMD's pool (`setImdPool`).
+split's payees and shares (`setPayees`), the perps fees' (`setPerpFeeTo`), the IMD6900 fees' (`setCoinFeeTo`, burned by
+default), IMD's burn executor (`setImdBurn`, the canonical one by default), $IMD's pool (`setImdPool`). The plan: most
+of it to the NFT floor pot for now, later (one timelock batch, no redeploy) to a contract rewarding the frens who link
+their fren NFT as their identity.md avatar.
 
 The road to the pot, end to end (each step anyone's to call; `script/launch.sh pot` does them all): `harvest()` here,
 `burnImd(min)` for the $IMD share, the pot bridge's `bridge()` (Robinhood → Across → Ethereum, from 0.05 ETH), then on
@@ -44,6 +46,13 @@ identity.md NFTs at the floor with it, and what it resells them for buys IMD6900
 both chains: 0.1 ETH bridged over Across, then 0.0995 into the pot. The split is the Robinhood timelock's to change (`setPayees`, 12h public delay).
 
 ## The fee, and routing
+
+Two callers trade fee-free, by refund: the hook's perps engine and the launch (the timelock's sale of held coins).
+Inside its own swap such a caller calls the locked pool's `feeCheckpoint()` just before and `feeRefund(to)` just after;
+the locked pool owns all of the liquidity, so what it earned between the two is that swap's fee, to the wei, and it
+goes straight back. Everyone else pays the pool's 4.44%; nothing about the pool or the hook changes for Uniswap's
+router. The hook reports the engine's cost (`perpFeeBps`): the pool's fee until the timelock sets `perpRefunded` along
+with a refund-aware engine (PerpSwapLib.swapLeg), then only Uniswap's protocol fee (none today).
 
 4.44%, a plain static fee: Uniswap's router quotes the pool on its own (no dynamic fee, no return deltas, not a 0x91
 hook; Programmable's plan opts in to the hook list and Uniswap's API too). A v4 pool's fee can't change, so lowering it
@@ -58,10 +67,11 @@ Before the launch the ETH never leaves the team wallet (`withdrawEth` returns an
 sits in the pool against the coins the buy landed, and the launch holds those coins. The timelock (12h public delay)
 can sell them back into the pool, ETH to any address (`sellHeld(amount, minEth, to)`), and can end the claims early
 (`endClaims()`: the unclaimed reserve joins what it can sell; holders see it 12h ahead and can claim first; what they
-claimed is theirs). Selling everything right after the launch returns the buy less 4.44% each way, plus the buy's fee
-through the split: on a fork, 2.54 ETH for the 2.77 spent, ~92% of the 2.81 with what the buy didn't spend (~96% with
-the split pointed at the team for that harvest); the excess alone, claims kept, ~1.3 ETH. Later, it depends on the price the market left.
-`script/launch.sh recover` (`END_CLAIMS=1` for the reserve too) queues it, `recover-exec` runs it.
+claimed is theirs). The sale is fee-free (the refund above, three rounds in one transaction), so selling everything
+right after the launch returns what the buy put into the curve; the buy's own 4.44% went to the split (all of it back
+too if the timelock points the split at the team for that harvest). In tests: 2.8098 of 2.81 ETH with nobody's claim
+kept; on a Robinhood fork after other trades and a fee move, 2.75; the excess alone, claims kept, ~1.37. Later, it
+depends on the price the market left. `script/launch.sh recover` (`END_CLAIMS=1` for the reserve too) queues it, `recover-exec` runs it.
 
 ## Perps: what the engine (its own audit and deploy, later) must respect
 
@@ -91,7 +101,7 @@ the opening buy's ETH or end the claims early: each visible 12h before it runs.
 ## Tests
 
 ```sh
-forge test                                         # 40 tests, offline: admission, the 0x6900 coin, launch, pool, fees, the fee's move (never with perps open), $IMD burn, perps fees, claims, the ETH back
+forge test                                         # 44 tests, offline: admission, the 0x6900 coin, launch, pool, fees, refunds, the fee's move (never with perps open), $IMD burn, perps fees, claims, the ETH back
 ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-contract RobinhoodFork -vv
 ```
 

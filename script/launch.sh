@@ -208,12 +208,13 @@ import json; d=json.load(open('review.json')); print(json.dumps({k: d.get(k) for
     TARGETS="[$LAUNCH]"
     AMOUNT=$HELD
     if [ "${END_CLAIMS:-0}" = 1 ] && [ "$RESERVE" != 0 ]; then AMOUNT=$(python3 -c "print($HELD + $RESERVE)"); fi
-    # the sale's quote at today's price (the position's one range, so a constant product): the floor under it is
+    # the sale's quote at today's price (the position's one range, so a constant product; the sale is refunded, so
+    # fee-free but for 4.44% cubed left held): the floor under it is
     # SLIPPAGE percent (default 5: the price moves in 12h; MIN_ETH sets it outright)
     read -r SQ _ LIQ < <(cast call $(c $LAUNCH 'pool()(address)') 'state()(uint160,int24,uint128)' --rpc-url "$RPC" | awk '{print $1}' | xargs)
     FEE=$(c $(c $LAUNCH 'pool()(address)') 'fee()(uint24)')
     QUOTE=$(python3 -c "
-q=2**96; sq,l,dy=$SQ,$LIQ,$AMOUNT*(1-$FEE/1e6); sq2=sq+dy*q/l; print(int(l*q*(sq2-sq)/(sq*sq2)))")
+q=2**96; sq,l,dy=$SQ,$LIQ,$AMOUNT*(1-($FEE/1e6)**3); sq2=sq+dy*q/l; print(int(l*q*(sq2-sq)/(sq*sq2)))")  # fee-free: three refunded rounds
     MIN=${MIN_ETH:-$(python3 -c "print(int($QUOTE*(100-${SLIPPAGE:-5})/100))")}
     DATAS="[$(cast calldata 'sellHeld(uint256,uint256,address)' 0 $MIN $TEAM)]"
     if [ "${END_CLAIMS:-0}" = 1 ] && [ "$RESERVE" != 0 ]; then

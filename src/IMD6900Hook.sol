@@ -12,6 +12,7 @@ import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "@uniswap/v4-core/src/type
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {Ownable} from "solady/auth/Ownable.sol";
 
 /// @notice IMD6900LockedPool: the one position this hook allows, the coin it pairs with ETH, and the pool's fee
@@ -52,11 +53,15 @@ contract IMD6900Hook is BaseHook, Ownable {
     address public perpEngine;
     /// @notice Escape hatch: trade even when the pre-trade sweep can't run (meant only while an engine is replaced)
     bool public sweepFailOpen;
+    /// @notice The wired engine takes its fees back (IMD6900LockedPool.feeCheckpoint / feeRefund around each swap):
+    ///         then {perpFeeBps} reports only what can't come back. Off until the timelock says the engine does.
+    bool public perpRefunded;
     /// @notice The pool this hook serves: the newest the locked pool initialized
     PoolId public poolId;
 
     event PerpEngineSet(address engine);
     event SweepFailOpenSet(bool on);
+    event PerpRefundedSet(bool on);
 
     error NotOurPool();
     error OnlyPool();
@@ -94,10 +99,21 @@ contract IMD6900Hook is BaseHook, Ownable {
         });
     }
 
-    /// @notice The fee the perps engine's own swaps pay, in basis points (PerpEngine reads it to price closes and
-    ///         liquidations; without it, it assumes its 10% cap): the pool's static fee, the same for everyone
+    /// @notice The fee the perps engine's own swaps cost it, in basis points, rounded up (PerpEngine prices closes and
+    ///         liquidations with it; without it, it assumes its 10% cap). The pool's static fee, unless the engine takes
+    ///         it back ({perpRefunded}): then only Uniswap's protocol fee is left (none today).
     function perpFeeBps() public view returns (uint256) {
-        return ILockedPoolView(pool).fee() / 100;
+        if (!perpRefunded) return (uint256(ILockedPoolView(pool).fee()) + 99) / 100;
+        (,, uint24 protocolFee,) = StateLibrary.getSlot0(poolManager, poolId);
+        uint256 a = protocolFee & 0xfff;
+        uint256 b = protocolFee >> 12;
+        return ((a > b ? a : b) + 99) / 100;
+    }
+
+    /// @notice Who refunds the perps engine's fees: the locked pool, the owner of all the liquidity (the engine finds
+    ///         it here, PerpSwapLib)
+    function launcher() external view returns (address) {
+        return pool;
     }
 
     /*                       OWNER (the Robinhood timelock)                  */
@@ -107,6 +123,12 @@ contract IMD6900Hook is BaseHook, Ownable {
     function setPerpEngine(address engine) external onlyOwner {
         perpEngine = engine;
         emit PerpEngineSet(engine);
+    }
+
+    /// @notice Set with the engine it describes: only an engine that calls the refund pair may be reported fee-free
+    function setPerpRefunded(bool on) external onlyOwner {
+        perpRefunded = on;
+        emit PerpRefundedSet(on);
     }
 
     function setSweepFailOpen(bool on) external onlyOwner {

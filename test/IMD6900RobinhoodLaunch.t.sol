@@ -72,6 +72,37 @@ contract Engine is Trader {
     function openCount() external pure returns (uint256) { return 0; }
 }
 
+/// A perps engine that takes its fee back the way PerpSwapLib.swapLeg does: checkpoint, swap, refund, in its unlock
+contract RefundingEngine {
+    IPoolManager immutable pm;
+    IMD6900LockedPool immutable lp;
+    PoolKey key;
+    constructor(IPoolManager pm_, IMD6900LockedPool lp_) { (pm, lp) = (pm_, lp_); }
+    function sweepLiquidations(address, int256, bool, uint160) external pure returns (uint8) { return 0; }
+    function openCount() external pure returns (uint256) { return 0; }
+    function swap(PoolKey calldata k, bool buy, int256 amt) external returns (uint256 r0, uint256 r1) {
+        key = k;
+        (r0, r1) = abi.decode(pm.unlock(abi.encode(buy, amt)), (uint256, uint256));
+    }
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        (bool buy, int256 amt) = abi.decode(data, (bool, int256));
+        lp.feeCheckpoint();
+        BalanceDelta d = pm.swap(key, SwapParams(buy, amt, buy ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1), "");
+        (uint256 r0, uint256 r1) = lp.feeRefund(address(this));
+        if (buy) {
+            pm.settle{value: uint128(-d.amount0())}();
+            pm.take(key.currency1, address(this), uint128(d.amount1()));
+        } else {
+            pm.sync(key.currency1);
+            IERC20(Currency.unwrap(key.currency1)).transfer(address(pm), uint128(-d.amount1()));
+            pm.settle();
+            pm.take(key.currency0, address(this), uint128(d.amount0()));
+        }
+        return abi.encode(r0, r1);
+    }
+    receive() external payable {}
+}
+
 /// A perps engine whose open positions the test sets (and one that can't say)
 contract CountingEngine {
     uint256 public openCount;
@@ -521,6 +552,69 @@ contract IMD6900RobinhoodLaunchTest is Test {
         assertEq(eth, 0);
     }
 
+    function test_TheEngineTradesFeeFree() public {
+        (address t,) = _launch();
+        RefundingEngine engine = new RefundingEngine(PM, pool);
+        vm.deal(address(engine), 10 ether);
+        vm.prank(TL);
+        hook.setPerpEngine(address(engine));
+        PoolKey memory k = pool.poolKey();
+        (uint256 r0,) = engine.swap(k, true, -1 ether);
+        assertApproxEqAbs(r0, 0.0444 ether, 1e10, "the buy's 4.44% back, in ETH");
+        assertApproxEqAbs(address(engine).balance, 9 ether + r0, 0, "it paid 1 ETH and got the fee straight back");
+        uint256 coins = IERC20(t).balanceOf(address(engine));
+        (, uint256 r1) = engine.swap(k, false, -int256(coins));
+        assertApproxEqRel(r1, coins * 444 / 10_000, 1e12, "the sell's 4.44% back, in the coin");
+        // a trader in between pays as usual, and only its fee (and the opening buy's) reaches the split
+        trader.swap(k, true, -1 ether);
+        (uint256 eth,) = pool.collect();
+        assertApproxEqRel(eth, (1 ether + BUY) * 444 / 10_000, 0.001e18, "the engine's fees never reach the split");
+    }
+
+    function test_OnlyTheEngineAndTheLaunchAreRefunded() public {
+        _launch();
+        assertTrue(pool.isRefunded(address(L)), "the launch's sale");
+        assertFalse(pool.isRefunded(address(trader)));
+        assertFalse(pool.isRefunded(address(0)), "no engine wired: nobody else");
+        vm.prank(address(trader));
+        vm.expectRevert(IMD6900LockedPool.NotRefunded.selector);
+        pool.feeCheckpoint();
+        RefundingEngine engine = new RefundingEngine(PM, pool);
+        vm.prank(TL);
+        hook.setPerpEngine(address(engine));
+        assertTrue(pool.isRefunded(address(engine)));
+        vm.prank(address(engine)); // a refund needs the same caller's checkpoint, in the same transaction
+        vm.expectRevert(IMD6900LockedPool.NoCheckpoint.selector);
+        pool.feeRefund(address(engine));
+    }
+
+    function test_TheHookReportsTheEnginesFee() public {
+        _launch();
+        assertEq(hook.perpFeeBps(), 444, "until the timelock says the engine takes it back");
+        vm.prank(OWNER);
+        vm.expectRevert(Ownable.Unauthorized.selector);
+        hook.setPerpRefunded(true);
+        vm.prank(TL);
+        hook.setPerpRefunded(true);
+        assertEq(hook.perpFeeBps(), 0, "then only Uniswap's protocol fee, none today");
+        assertEq(hook.launcher(), address(pool), "where the engine finds its refunds");
+    }
+
+    function test_TheCoinFeeGoesWhereTheTimelockSays() public {
+        (address t,) = _launch();
+        PoolKey memory k = pool.poolKey();
+        trader.swap(k, true, -1 ether);
+        trader.swap(k, false, -int256(IERC20(t).balanceOf(address(trader))));
+        vm.prank(OWNER);
+        vm.expectRevert(IMD6900LockedPool.OnlyTimelock.selector);
+        pool.setCoinFeeTo(R);
+        vm.prank(TL);
+        pool.setCoinFeeTo(R);
+        (, uint256 coinsFee) = pool.collect();
+        assertGt(coinsFee, 0);
+        assertEq(IERC20(t).balanceOf(R), coinsFee, "not burned: sent where it was pointed");
+    }
+
     function test_NoFeeMoveWhilePerpsAreOpen() public {
         _launch();
         CountingEngine engine = new CountingEngine();
@@ -633,11 +727,8 @@ contract IMD6900RobinhoodLaunchTest is Test {
         uint256 eth = L.sellHeld(0, 0, R);
         emit log_named_decimal_uint("the excess alone, sold back: ETH", eth, 18);
         assertEq(R.balance, eth);
-        assertEq(L.excessHeld(), 0);
-        assertEq(IERC20(t).balanceOf(address(L)), AA + BB + CC, "the claims' reserve untouched");
-        vm.prank(TL);
-        vm.expectRevert(IMD6900RobinhoodLaunch.ZeroAmount.selector);
-        L.sellHeld(0, 0, R);
+        assertLt(L.excessHeld(), held / 10_000, "fee-free: only 4.44% cubed of it came back unsold");
+        assertEq(IERC20(t).balanceOf(address(L)), AA + BB + CC + L.excessHeld(), "the claims' reserve untouched");
     }
 
     function test_EndingTheClaimsBringsMostOfTheBuyBack() public {
@@ -673,7 +764,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
         L.harvest();
         emit log_named_decimal_uint("back of the 2.81 ETH buy (C's claim kept by C)", R.balance, 18);
         assertGe(R.balance, BUY * 90 / 100, "most of it");
-        assertEq(IERC20(t).balanceOf(address(L)), 0);
+        assertLt(IERC20(t).balanceOf(address(L)), 20_000 ether, "dust of the last round's refund");
     }
 
     function test_NoClaimsAllOfItBack() public {
@@ -689,8 +780,8 @@ contract IMD6900RobinhoodLaunchTest is Test {
         L.sellHeld(0, 0, R);
         L.harvest();
         emit log_named_decimal_uint("back of the 2.81 ETH buy, nobody claimed", R.balance, 18);
-        assertGe(R.balance, BUY * 95 / 100, "all of it but the sell's 4.44%");
-        assertLe(IERC20(t).balanceOf(address(L)), 1e18, "dust");
+        assertGe(R.balance, BUY * 99 / 100, "all of it: the sale is fee-free, the buy's fee comes back through the split");
+        assertLt(IERC20(t).balanceOf(address(L)), 20_000 ether, "dust of the last round's refund");
     }
 
     function test_PerpFeesGoAllToThePot() public {
