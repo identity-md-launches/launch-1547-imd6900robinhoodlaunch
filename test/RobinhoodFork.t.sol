@@ -42,23 +42,37 @@ struct ExactInputSingleParams {
 contract ForkTrader {
     IPoolManager immutable pm;
     PoolKey key;
-    constructor(IPoolManager pm_) { pm = pm_; }
+
+    constructor(IPoolManager pm_) {
+        pm = pm_;
+    }
+
     function swap(PoolKey calldata k, bool buy, int256 amountSpecified) external payable returns (BalanceDelta d) {
         key = k;
         d = abi.decode(pm.unlock(abi.encode(buy, amountSpecified)), (BalanceDelta));
     }
+
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         (bool buy, int256 amt) = abi.decode(data, (bool, int256));
-        BalanceDelta d = pm.swap(key, SwapParams(buy, amt, buy ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1), "");
+        BalanceDelta d =
+            pm.swap(key, SwapParams(buy, amt, buy ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1), "");
         _settle(key.currency0, d.amount0());
         _settle(key.currency1, d.amount1());
         return abi.encode(d);
     }
+
     function _settle(Currency c, int128 v) internal {
         if (v < 0) {
-            if (c.isAddressZero()) pm.settle{value: uint128(-v)}();
-            else { pm.sync(c); IERC20(Currency.unwrap(c)).transfer(address(pm), uint128(-v)); pm.settle(); }
-        } else if (v > 0) pm.take(c, address(this), uint128(v));
+            if (c.isAddressZero()) {
+                pm.settle{value: uint128(-v)}();
+            } else {
+                pm.sync(c);
+                IERC20(Currency.unwrap(c)).transfer(address(pm), uint128(-v));
+                pm.settle();
+            }
+        } else if (v > 0) {
+            pm.take(c, address(this), uint128(v));
+        }
     }
     receive() external payable {}
 }
@@ -107,15 +121,19 @@ contract RobinhoodForkTest is Test {
         vm.deal(TEAM, 2.81 ether);
         bytes32 salt = CoinSalt.mine(L); // 0x6900, as script/mine.sh finds it
         address expected = L.tokenAddress(salt);
-        uint160 sp = uint160(_sqrt(FullMath.mulDiv(SUPPLY, 1 << 192, 19.40 ether)));
+        uint160 sp = uint160(_sqrt(FullMath.mulDiv(SUPPLY, 1 << 192, 19.4 ether)));
         vm.prank(TEAM);
         (address t, uint256 bought) = L.launch{value: 2.81 ether}(salt, expected, sp, 0, address(L)); // as launch.sh: the excess kept
         emit log_named_decimal_uint("opening buy, coins", bought, 18);
         IMD6900LockedPool pool = L.pool();
         uint128 locked = pool.liquidity();
         (uint160 sq,,) = pool.state();
-        emit log_named_decimal_uint("market cap after it, ETH on 1B", FullMath.mulDiv(FullMath.mulDiv(SUPPLY, 1 << 96, sq), 1 << 96, sq), 18);
-        assertEq(IERC20(t).balanceOf(address(L)), b1 + b2 + L.excessHeld(), "the claims' reserve and the excess, both here");
+        emit log_named_decimal_uint(
+            "market cap after it, ETH on 1B", FullMath.mulDiv(FullMath.mulDiv(SUPPLY, 1 << 96, sq), 1 << 96, sq), 18
+        );
+        assertEq(
+            IERC20(t).balanceOf(address(L)), b1 + b2 + L.excessHeld(), "the claims' reserve and the excess, both here"
+        );
 
         // claims open with the timelock's op, as on the day
         vm.prank(TL);
@@ -156,6 +174,7 @@ contract RobinhoodForkTest is Test {
         // the $IMD share: bought on $IMD's Robinhood pool, sent to its official burn executor
         address exec = L.IMD_BURN();
         uint256 execBefore = IERC20(L.IMD()).balanceOf(exec);
+        vm.prank(TEAM); // the burn's keeper
         uint256 got = L.burnImd(0);
         emit log_named_decimal_uint("$IMD bought for the burn executor", got, 18);
         assertEq(IERC20(L.IMD()).balanceOf(exec) - execBefore, got);
@@ -176,7 +195,9 @@ contract RobinhoodForkTest is Test {
         assertEq(PM.getLiquidity(k.toId()), 0, "the 4.44% pool is empty");
         uint256 before2 = IERC20(t).balanceOf(buyer);
         _routerBuy(buyer, k2, 0.5 ether);
-        emit log_named_decimal_uint("bought through the Universal Router at 3.33%", IERC20(t).balanceOf(buyer) - before2, 18);
+        emit log_named_decimal_uint(
+            "bought through the Universal Router at 3.33%", IERC20(t).balanceOf(buyer) - before2, 18
+        );
         assertGt(IERC20(t).balanceOf(buyer), before2, "Uniswap's router trades the new pool");
         vm.expectRevert();
         tr.swap(k, true, -0.1 ether);

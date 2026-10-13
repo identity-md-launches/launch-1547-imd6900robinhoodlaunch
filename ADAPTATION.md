@@ -1,8 +1,8 @@
 # Launch adaptation
 
 The existing constructor already supports the contracts-only launch. The production-code changes are the three
-reproduced audit fixes in `src/IMD6900RobinhoodLaunch.sol` (first round) and the independent review's reproduced
-findings (the revision, listed last). The coin's source, the build configuration, the vendored dependencies, the
+reproduced audit fixes in `src/IMD6900RobinhoodLaunch.sol` (first round) and the independent reviews' reproduced
+findings (the two revisions, listed last). The coin's source, the build configuration, the vendored dependencies, the
 addresses, the launch's constructor signature, the hook's constructor and permissions, the 4.44% static fee and the
 launch economics remain unchanged.
 
@@ -136,13 +136,8 @@ positions can never close keeps both its wiring and the fee fixed, which is what
 
 ### The $IMD buy could be sandwiched on a thin pool — `bbf57e19fc03` (medium)
 
-`src/IMD6900RobinhoodLaunch.sol`: `burnImd` sizes each buy to the pool, at most `IMD_BUY_MAX` and no more than the
-pool's fee fraction of the ETH its in-range liquidity stands for (`L * 2^96 / sqrtP * fee / 1e6`), so the buy's own
-price impact stays under the fee a sandwich pays twice over, whatever `minImd` the caller passes. With the review's
-pool (2e19 full-range liquidity) each buy is about 0.0124 ETH and front-runs of 0.05, 0.1, 0.3 and 1 ETH all lose;
-with the earlier audit's 2e20 pool the full 0.1 ETH still goes through. A pool with no in-range liquidity keeps the
-existing `IncompleteImdBuy` path. No oracle, TWAP or keeper role was added; a thin pool drains the bucket over more
-blocks. The per-block cap from the first round stays.
+Superseded by the second revision (`4648ff622012` below): the fix here sized each buy to the pool's in-range liquidity
+and the reviewer showed that bound is the sandwicher's to set. The cap is gone; the buy is the keeper's, at its floor.
 
 ### Advisory findings, all reproduced and fixed
 
@@ -155,17 +150,73 @@ blocks. The per-block cap from the first round stays.
   launch, repoint `setImdPool` to any pool anyone's `burnImd` then trades on, and wire any engine with `setPerpEngine`
   (a refunded caller in the locked pool, called with nearly all remaining gas on every trader's swap).
 
-Runtime size after the revision: `IMD6900RobinhoodLaunch` is **24,215 bytes**, 361 bytes under EIP-170 (the hook's
-creation code it embeds grew with its two changes); the locked pool's creation code is only in the launch's initcode
-(36,582 bytes, under EIP-3860). Any further growth of the launch or the hook must stay within that margin.
+## Second revision: the review of the first
+
+Each finding was reproduced on the accepted tree before anything changed. The regressions are in
+`test/LaunchReview.t.sol`; the earlier burn tests in `test/LaunchAudit.t.sol` and the two launch tests that call
+`burnImd` now call it as the keeper (the audit suite names itself keeper through the timelock in `setUp`; the others
+prank the owner), and keep what they asserted.
+
+### The thin-pool cap reads liquidity the sandwicher supplies — `4648ff622012` (medium)
+
+Reproduced with the reviewer's steps (`test/scratch`, the same `Proof_JitBurnSandwich`): a 2e21 $IMD-only position in
+ticks [51400, 51500], a 1 ETH front-run limited to tick 51500 (0.29 ETH taken, the tick landing at 51499), then
+`burnImd(0)` by the attacker: the cap read the attacker's position as depth, the whole 0.1 ETH went through at 170.55
+$IMD/ETH against the honest 255.86, and after unwinding the attacker held 10.026254724996830573 ETH of its 10.
+
+The cause is what the reviewer named: a public, caller-sized buy has no price reference the pool itself can give, since
+whatever it reads (in-range liquidity, the spot price, the buy's own impact) its counterparty sets in the same block,
+and a reference recorded in an earlier block costs an attacker only a block's hold on a chain with 250 ms blocks and no
+mempool. `src/IMD6900RobinhoodLaunch.sol`: `burnImd` is now the burn keeper's call (`NotKeeper` for anyone else), the
+reviewer's second option. The keeper is `imdKeeper`, the owner (the team wallet) while it is zero, and the timelock
+names another with `setImdKeeper` (zero: the owner again), as it names every other part of the burn (`setImdBurn`,
+`setImdPool`). The keeper quotes the buy with an `eth_call` and passes a floor; that floor is the buy's price
+protection, and `script/launch.sh pot` has always run it that way (from the team wallet, 97% of the quote). The
+liquidity cap of the first revision is removed with its reads (`getLiquidity`, `getSlot0`, `FullMath`): it bounded
+nothing a sandwicher could not set, and would have made the keeper's floor fail whenever it cut the spend. A buy is
+sized by the bucket alone again (at most `IMD_BUY_MAX`), one per block as before. Design change acknowledged: the brief
+describes `burnImd` as anyone's; the finding is reproduced and both its fix options that keep the buy public need a
+reference the pool does not have (no oracle hook, no TWAP) or the owner's bot anyway. The timelock keeps the escape:
+a keeper that goes dark is replaced, and `recoverEth` still reaches the bucket.
+
+`test_TheBurnIsTheKeepersAtItsOwnFloor`: the attacker's call reverts `NotKeeper`; under the review's exact sandwich
+the keeper's buy at its floor reverts `Short` and spends nothing, and the sandwicher ends under 10 ETH (two fees for
+nothing); the same for plain front-runs of 0.05, 0.1, 0.3 and 1 ETH; undisturbed, the keeper's buy spends the full
+0.1 ETH and returns the quote. `test_TheTimelockNamesTheKeeper`: only the timelock names one; the owner is refused
+while one is named, and is the keeper again at zero.
+
+### split() returned before paying the books — `92fe6a73cd47` (low)
+
+Reproduced: with 0.9 ETH booked to a refusing payee and nothing new, `split()` returned 0 at the early return and a
+payee that had started accepting stayed unpaid until new ETH arrived. The early return now needs `owedTotal == 0`
+too, so a split with nothing new runs the loop with `part = 0` and pays the books alone (`test_SplitPaysTheBooksAlone`).
+`split()` still returns what was new (0 here).
+
+### A dropped payee's books were stuck until recoverEth — `b63401ab3622` (low)
+
+Reproduced: `setPayees` overwrote the list and a dropped payee's 0.5 ETH book stayed out of every split, with only
+`recoverEth` (which cancels every book) to reach it. `setPayees` now cancels the books of the payees it drops
+(`OwedCancelled`, `owedTotal` reduced), so the next split divides that ETH again; a payee kept in the new list keeps
+its books (`test_SetPayeesCancelsTheBooksOfThoseItDrops`). The old list is read through `payees()`, so the default
+pot bridge is covered too. Cancelling rather than paying: a payee is dropped because it refuses, and relisting it pays.
+
+### The cap's dependence on the key's fee — `3a5795e7b617` (low)
+
+Reproduced on the accepted tree by reading the cap's formula (a zero fee makes the cap 0 and the buy `NoEth`; the
+dynamic-fee flag makes it 8.39x). Resolved by the removal of the cap under `4648ff622012`: nothing in `burnImd` reads
+the key's fee any more, so a zero-fee or dynamic-fee pool trades like any other and the keeper's floor bounds the buy.
+
+Runtime size after the second revision: `IMD6900RobinhoodLaunch` is **24,246 bytes**, 330 bytes under EIP-170 (the
+keeper and the two book changes added more than the cap's removal saved); initcode 36,620 bytes, under EIP-3860.
+Any further growth of the launch or the hook must stay within that margin.
 
 ## Local verification results
 
-- `forge build --sizes`: passed with the existing configuration. Launch runtime is **24,215 bytes**, 361 bytes
-  below EIP-170; creation code 36,582 bytes, below EIP-3860. No library links remain.
-- `forge test --offline`: passed, 72 tests (59 from before plus the 13 revision regressions), the 256-run claims
-  fuzz test included, plus the fork test's early return when `ROBINHOOD_RPC_URL` is unset. No live fork execution is
-  claimed.
+- `forge build --sizes`: passed with the existing configuration. Launch runtime is **24,246 bytes**, 330 bytes
+  below EIP-170; creation code 36,620 bytes, below EIP-3860. No library links remain.
+- `forge test --offline`: passed, 74 tests (72 from before, the two superseded cap tests replaced by four regressions),
+  the 256-run claims fuzz test included, plus the fork test's early return when `ROBINHOOD_RPC_URL` is unset. No live
+  fork execution is claimed.
 - The four supplied proofs (`Proof_4891b788d800`, `Proof_959b71d4fb20`, `Proof_a8a1088f7ba1`, `Proof_1e3202b54640`)
   were copied unchanged into scratch space and run one at a time against the final tree: all four pass (the first three
   failed on the starting tree). The protected `Contracts.protected.t.sol` harness was exercised in the first round; the

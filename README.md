@@ -47,12 +47,14 @@ both chains: 0.1 ETH bridged over Across, then 0.0995 into the pot. The split is
 paused bridge) has it booked to it (`owed(payee)`): the next split offers it again with its new share, and no other
 payee's split ever includes it; the timelock's `recoverEth` cancels the books when it reaches into them.
 
-`burnImd` permits one successful buy of at most 0.1 ETH per `block.number`, shared by all callers, and less on a thin
-pool: the buy is sized so its price impact stays under the pool's fee (1% of the ETH the in-range liquidity stands for),
-so a sandwich around it pays more in fees than it takes, whatever `minImd` the caller passes. Repeating it within
-that block reverts; `nextImdBurnBlock()` reports when another buy is allowed. An incomplete fill or a failed `minImd`
-check reverts the entire buy, preserving both the burn reserve and the ability to retry. This cap limits batching;
-it is not an oracle or a guarantee against price manipulation. See `ADAPTATION.md` for the reproduced audit findings.
+`burnImd(minImd)` is the burn's keeper's to call: the owner (the team wallet) until the timelock names another
+(`setImdKeeper`; zero means the owner again). The keeper quotes the buy with an `eth_call` and passes a floor
+(`script/launch.sh pot` passes 97% of the quote); that floor is the buy's price protection. It is not public: a public
+buy has no reference price the pool itself can give, since whatever it reads (in-range liquidity, the spot price), a
+sandwicher sets in the same block with a just-in-time position. One successful buy of at most 0.1 ETH per
+`block.number`; repeating it within that block reverts, and `nextImdBurnBlock()` reports when another buy is allowed.
+An incomplete fill or a failed `minImd` check reverts the entire buy, preserving both the burn reserve and the ability
+to retry. See `ADAPTATION.md` for the reproduced audit findings.
 
 ## The fee, and routing
 

@@ -39,6 +39,8 @@ contract LaunchAuditTest is Test {
         launch = new IMD6900RobinhoodLaunch(OWNER, pm, address(oldToken), TL);
         launch.createHook(HookSalt.mine(launch));
         coinSalt = CoinSalt.mine(launch);
+        vm.prank(TL);
+        launch.setImdKeeper(address(this)); // this test runs the burns
     }
 
     // d7faa1b3073d: the same 10 ETH sandwich loses money around one 0.1 ETH burn,
@@ -92,11 +94,15 @@ contract LaunchAuditTest is Test {
         _earnBurnFees();
         uint256 bucket = launch.imdBucket();
         uint256 nextBlock = block.number + 1;
+        vm.prank(TL);
+        launch.setImdKeeper(A);
         vm.prank(A);
         uint256 first = launch.burnImd(0);
         assertEq(launch.nextImdBurnBlock(), nextBlock);
-        // Different callers and a later timestamp cannot bypass a cap for the same block.number.
+        // A new keeper and a later timestamp cannot bypass a cap for the same block.number.
         vm.warp(block.timestamp + 60);
+        vm.prank(TL);
+        launch.setImdKeeper(B);
         vm.prank(B);
         vm.expectRevert(IMD6900RobinhoodLaunch.BurnRateLimited.selector);
         launch.burnImd(0);

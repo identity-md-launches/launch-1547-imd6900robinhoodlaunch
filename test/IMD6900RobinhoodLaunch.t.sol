@@ -552,6 +552,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
         L.harvest();
         uint256 bucket = L.imdBucket();
         assertGt(bucket, 0.1 ether, "more than one call's worth");
+        vm.prank(OWNER); // the burn's keeper, until the timelock names one
         uint256 got = L.burnImd(0);
         assertEq(MockImdstr(imd).balanceOf(L.IMD_BURN()), got, "the $IMD is at the burn executor");
         assertApproxEqRel(got, 0.099 ether * 261, 0.02e18, "0.1 ETH of $IMD, less the pool's fee");

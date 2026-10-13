@@ -17,9 +17,10 @@
 #   script/launch.sh submit        creates it on Programmable (their manual review starts), then `review` polls it
 #   script/launch.sh review        the plan's state on Programmable, and its price drift (below)
 #   script/launch.sh drift         where the plan's launch lands vs Ethereum's price now: its price is fixed when built
-#   script/launch.sh pot           after the launch, the fees on their way (anyone may do each part): harvest (90% to
-#                                  the pot bridge, 10% set aside for $IMD), burnImd (buys $IMD for IMD's canonical burn
-#                                  executor), bridge (Robinhood -> Across -> Ethereum, from 0.05 ETH), then on Ethereum
+#   script/launch.sh pot           after the launch, the fees on their way: harvest (anyone; 90% to the pot bridge, 10%
+#                                  set aside for $IMD), burnImd (the burn's keeper: the team wallet unless the timelock
+#                                  names another; it passes 97% of the buy's quote as the floor, and buys $IMD for IMD's
+#                                  canonical burn executor), bridge (anyone; Robinhood -> Across -> Ethereum, from 0.05 ETH), then on Ethereum
 #                                  depositBridgedFees (what Across delivered joins the NFT pot). ETH_RPC_URL for Ethereum.
 #   script/launch.sh recover       after the launch, the opening buy's ETH back: queues on the timelock the sale of the coins
 #                                  the launch holds (END_CLAIMS=1: the unclaimed reserve too, claims end) to the team wallet

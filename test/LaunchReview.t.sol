@@ -9,7 +9,7 @@ import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
@@ -56,6 +56,49 @@ contract LimitTrader {
         IMD6900(Currency.unwrap(key.currency1)).transfer(address(pm), uint128(-d.amount1()));
         pm.settle();
         if (d.amount0() > 0) pm.take(key.currency0, address(this), uint128(d.amount0()));
+        return "";
+    }
+    receive() external payable {}
+}
+
+/// A sandwicher that puts liquidity anywhere (just in time) and swaps up to a price limit
+contract Jit {
+    IPoolManager immutable pm;
+    PoolKey key;
+    bool isSwap;
+    bool zeroForOne;
+    int24 lo;
+    int24 hi;
+    int256 amount; // the liquidity delta, or the swap's amountSpecified
+    uint160 limit;
+
+    constructor(IPoolManager pm_) {
+        pm = pm_;
+    }
+
+    function modify(PoolKey calldata k, int24 lo_, int24 hi_, int256 delta) external {
+        (key, isSwap, lo, hi, amount) = (k, false, lo_, hi_, delta);
+        pm.unlock("");
+    }
+
+    function swapTo(PoolKey calldata k, bool zeroForOne_, int256 amt, uint160 limit_) external {
+        (key, isSwap, zeroForOne, amount, limit) = (k, true, zeroForOne_, amt, limit_);
+        pm.unlock("");
+    }
+
+    function unlockCallback(bytes calldata) external returns (bytes memory) {
+        BalanceDelta d;
+        if (isSwap) d = pm.swap(key, SwapParams(zeroForOne, amount, limit), "");
+        else (d,) = pm.modifyLiquidity(key, ModifyLiquidityParams(lo, hi, amount, 0), "");
+        if (d.amount0() < 0) pm.settle{value: uint128(-d.amount0())}();
+        else if (d.amount0() > 0) pm.take(key.currency0, address(this), uint128(d.amount0()));
+        if (d.amount1() < 0) {
+            pm.sync(key.currency1);
+            MockImdstr(Currency.unwrap(key.currency1)).transfer(address(pm), uint128(-d.amount1()));
+            pm.settle();
+        } else if (d.amount1() > 0) {
+            pm.take(key.currency1, address(this), uint128(d.amount1()));
+        }
         return "";
     }
     receive() external payable {}
@@ -324,45 +367,132 @@ contract LaunchReviewTest is Test {
         assertEq(hook.perpEngine(), address(0));
     }
 
-    /*            bbf57e19fc03: a burn on a thin $IMD pool is too small to sandwich at a profit            */
+    /*   bbf57e19fc03, 4648ff622012: the $IMD buy is the keeper's, at the floor it quotes; nobody else sizes it   */
 
-    function test_BurnOnAThinPoolCantBeSandwiched() public {
+    function test_TheBurnIsTheKeepersAtItsOwnFloor() public {
         _imdPool(2e19); // ~1.24 ETH a side at 261 $IMD/ETH
         _launch(address(launch));
         _earnBurnFees();
         PoolKey memory k = launch.imdPoolKey();
+        address imd = launch.IMD();
         uint256 bucket = launch.imdBucket();
-        uint256 honest;
+        // nobody but the keeper (the owner, until the timelock names one) buys: a sandwicher can't place the buy
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotKeeper.selector);
+        launch.burnImd(0);
+        // the keeper quotes the buy (eth_call) and passes 97% of it, as script/launch.sh does
+        uint256 quote;
         {
             uint256 snap = vm.snapshotState();
-            honest = launch.burnImd(0);
-            uint256 spent = bucket - launch.imdBucket();
-            assertLt(spent, 0.1 ether, "less than the cap on a thin pool");
-            assertApproxEqRel(spent, 0.0124 ether, 0.05e18, "1% of the ETH the in-range liquidity stands for");
+            vm.prank(OWNER);
+            quote = launch.burnImd(0);
+            assertEq(bucket - launch.imdBucket(), 0.1 ether, "sized by the bucket alone, not by the pool");
             vm.revertToState(snap);
         }
+        uint256 floor = quote * 97 / 100;
+        // the review's just-in-time sandwich: an $IMD-only position one spacing wide below the price, a front-run
+        // down to its top, then the buy, which would fill out of that position 33% under the honest price
+        Jit a = new Jit(pm);
+        vm.deal(address(a), 10 ether);
+        MockImdstr(imd).mint(address(a), 1000 ether);
+        a.modify(k, 51_400, 51_500, 2e21);
+        a.swapTo(k, true, -1 ether, TickMath.getSqrtPriceAtTick(51_500));
+        vm.prank(OWNER);
+        vm.expectPartialRevert(IMD6900RobinhoodLaunch.Short.selector);
+        launch.burnImd(floor);
+        assertEq(launch.imdBucket(), bucket, "nothing spent");
+        a.modify(k, 51_400, 51_500, -2e21);
+        a.swapTo(k, false, -int256(MockImdstr(imd).balanceOf(address(a)) - 1000 ether), TickMath.MAX_SQRT_PRICE - 1);
+        assertLt(address(a).balance, 10 ether, "the sandwicher paid two fees for nothing");
+        // a plain front-run through the real liquidity: the same
         uint256[4] memory fronts = [uint256(0.05 ether), 0.1 ether, 0.3 ether, 1 ether];
         for (uint256 i; i < fronts.length; ++i) {
             uint256 snap = vm.snapshotState();
             Trader attacker = new Trader(pm);
             vm.deal(address(attacker), 10 ether);
             attacker.swap(k, true, -int256(fronts[i]));
-            uint256 got = launch.burnImd(0);
-            attacker.swap(k, false, -int256(MockImdstr(launch.IMD()).balanceOf(address(attacker))));
-            emit log_named_decimal_uint("attacker ETH after", address(attacker).balance, 18);
-            assertLt(address(attacker).balance, 10 ether, "the sandwich loses");
-            assertGt(got, honest / 2, "and the burn still gets the better part of the honest buy");
+            vm.prank(OWNER);
+            vm.expectPartialRevert(IMD6900RobinhoodLaunch.Short.selector);
+            launch.burnImd(floor);
             vm.revertToState(snap);
         }
+        // undisturbed (the sandwicher's two fees moved the price a little), the quote holds
+        vm.prank(OWNER);
+        uint256 got = launch.burnImd(floor);
+        assertGe(got, floor);
+        assertApproxEqRel(got, quote, 0.01e18);
+        assertEq(MockImdstr(imd).balanceOf(launch.imdBurn()), got);
     }
 
-    function test_BurnOnADeepPoolSpendsTheCap() public {
-        _imdPool(2e20); // ~12.4 ETH a side
+    function test_TheTimelockNamesTheKeeper() public {
+        _imdPool(2e20);
         _launch(address(launch));
         _earnBurnFees();
-        uint256 bucket = launch.imdBucket();
+        vm.prank(OWNER);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotTimelock.selector);
+        launch.setImdKeeper(R);
+        vm.prank(TL);
+        launch.setImdKeeper(R);
+        assertEq(launch.imdKeeper(), R);
+        vm.prank(OWNER);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotKeeper.selector);
         launch.burnImd(0);
-        assertEq(bucket - launch.imdBucket(), 0.1 ether, "the full 0.1 ETH where the pool takes it");
+        vm.prank(R);
+        assertGt(launch.burnImd(0), 0, "the keeper buys");
+        vm.roll(block.number + 1);
+        vm.prank(TL);
+        launch.setImdKeeper(address(0));
+        vm.prank(R);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotKeeper.selector);
+        launch.burnImd(0);
+        vm.prank(OWNER);
+        assertGt(launch.burnImd(0), 0, "zero: the owner again");
+    }
+
+    /*          92fe6a73cd47: a payee that accepts again is paid its books, with nothing new to split          */
+
+    function test_SplitPaysTheBooksAlone() public {
+        _launch(address(launch));
+        RefusingPayee pot = new RefusingPayee();
+        _payees(address(pot));
+        vm.deal(address(this), 1 ether);
+        launch.addFees{value: 1 ether}();
+        launch.split();
+        assertEq(launch.owed(address(pot)), 0.9 ether);
+        pot.accept();
+        assertEq(launch.split(), 0, "nothing new");
+        assertEq(address(pot).balance, 0.9 ether, "but the books are paid");
+        assertEq(launch.owed(address(pot)), 0);
+        assertEq(launch.owedTotal(), 0);
+        assertEq(launch.imdBucket(), 0.1 ether);
+        assertEq(address(launch).balance, 0.1 ether);
+    }
+
+    /*            b63401ab3622: a payee setPayees drops has its books cancelled, the others' kept            */
+
+    function test_SetPayeesCancelsTheBooksOfThoseItDrops() public {
+        _launch(address(launch));
+        RefusingPayee p = new RefusingPayee();
+        address a = address(0xAA1); // not 0xA, a Cancun precompile that takes no ETH
+        address b = address(0xBB1);
+        _payees2(address(p), a);
+        vm.deal(address(this), 2.5 ether);
+        launch.addFees{value: 1 ether}();
+        launch.split();
+        assertEq(launch.owed(address(p)), 0.5 ether);
+        assertEq(a.balance, 0.5 ether);
+        _payees2(address(p), b); // kept: its books stay
+        assertEq(launch.owed(address(p)), 0.5 ether);
+        assertEq(launch.owedTotal(), 0.5 ether);
+        vm.expectEmit(address(launch));
+        emit IMD6900RobinhoodLaunch.OwedCancelled(0.5 ether);
+        _payees2(b, a); // dropped: cancelled, and divided again by the next split
+        assertEq(launch.owed(address(p)), 0);
+        assertEq(launch.owedTotal(), 0);
+        launch.addFees{value: 1.5 ether}();
+        assertEq(launch.split(), 2 ether);
+        assertEq(b.balance, 1 ether);
+        assertEq(a.balance, 1.5 ether);
+        assertEq(address(launch).balance, 0);
     }
 
     /*                               9907b6c0017b: no renouncing                               */
@@ -420,6 +550,14 @@ contract LaunchReviewTest is Test {
         address[] memory to = new address[](2);
         uint16[] memory bps = new uint16[](2);
         (to[0], bps[0], to[1], bps[1]) = (pot, 9_000, launch.imdBurn(), 1_000);
+        vm.prank(TL);
+        launch.setPayees(to, bps);
+    }
+
+    function _payees2(address x, address y) internal {
+        address[] memory to = new address[](2);
+        uint16[] memory bps = new uint16[](2);
+        (to[0], bps[0], to[1], bps[1]) = (x, 5_000, y, 5_000);
         vm.prank(TL);
         launch.setPayees(to, bps);
     }
