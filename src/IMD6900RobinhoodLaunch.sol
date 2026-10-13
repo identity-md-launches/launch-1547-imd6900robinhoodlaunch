@@ -7,6 +7,9 @@ import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
@@ -42,6 +45,9 @@ import {IMD6900LockedPool} from "./IMD6900LockedPool.sol";
 ///         which bridges it to Base to be destroyed. After the launch, ETH leaves only through the split, the $IMD
 ///         buys, or the timelock's {recoverEth}.
 contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
+
     /// @dev beforeInitialize, beforeAddLiquidity, beforeRemoveLiquidity, beforeSwap, afterSwap: no return deltas, no
     ///      dynamic fee, nothing that would cost the pool Uniswap's automatic routing
     uint160 public constant FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
@@ -60,7 +66,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     /// @notice The coin's address starts with this (its top 16 bits): {launch} refuses any other
     uint16 public constant VANITY = 0x6900;
     uint16 public constant IMD_BPS = 1_000;
-    /// @notice The most {burnImd} spends per block, across all callers (one successful buy)
+    /// @notice The most {burnImd} spends per block, across all callers (one successful buy); less when $IMD's pool is
+    ///         thin: a buy's price impact stays under the pool's fee, what a sandwich pays twice over
     uint256 public constant IMD_BUY_MAX = 0.1 ether;
     uint256 public constant MAX_PAYEES = 8;
     /// @notice Claims stay open at least this long after the launch before the unclaimed reserve can be released
@@ -117,6 +124,11 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     address[8] internal _payees;
     uint16[8] internal _shares;
     uint8 internal _payeeCount;
+    /// @notice ETH booked to payees that refused their share ({split} offers it again), in total; the books are
+    ///         cancelled when the timelock's {recoverEth} takes from them
+    uint256 public owedTotal;
+    uint256 internal _owedEpoch;
+    mapping(uint256 => mapping(address => uint256)) internal _owed;
 
     event HookCreated(address hook, bytes32 salt);
     event ClaimsSet(bytes32 root, uint256 total, uint256 deadline);
@@ -146,6 +158,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     event ImdBurnSet(address executor);
     event PerpFeeToSet(address to);
     event PerpFeesForwarded(address to, uint256 amount);
+    event OwedCancelled(uint256 amount);
 
     error HookExists();
     error BadHook();
@@ -166,6 +179,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     error OnlyPoolManager();
     error BurnRateLimited();
     error IncompleteImdBuy();
+    error BadTo();
+    error NoRenounce();
 
     /// @param owner_       the team wallet: launches, sets the claim list and the payees
     /// @param poolManager_ Uniswap v4's PoolManager on Robinhood Chain
@@ -259,6 +274,16 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         return unclaimedReleased ? 0 : claimTotal - claimedTotal;
     }
 
+    /// @notice What `payee` refused of its share and is booked to it
+    function owed(address payee) public view returns (uint256) {
+        return _owed[_owedEpoch][payee];
+    }
+
+    /// @notice Ownership never goes to nobody: the claims' IMDSTR and the unclaimed reserve need an owner to release
+    function renounceOwnership() public payable override onlyOwner {
+        revert NoRenounce();
+    }
+
     /*                                 OWNER                                */
 
     /// @notice The claim list, before the launch: `root` over leaves keccak256(keccak256(abi.encode(account, amount))),
@@ -319,7 +344,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         emit Launched(t, sqrtPriceX96, pool.upperTick(), spend, bought, excess, excessTo);
     }
 
-    /// @notice After the claim deadline, the unclaimed reserve: burned (`to` zero) or sent to `to`. Once.
+    /// @notice After the claim deadline, the unclaimed reserve: burned (`to` zero), kept here for the timelock (`to`
+    ///         this contract, as {launch} and {endClaims} keep it) or sent to `to`. Once.
     function releaseUnclaimed(address to) external onlyOwner nonReentrant {
         if (token == address(0)) revert NotLaunched();
         if (block.timestamp < claimDeadline) revert ClaimsOpen();
@@ -327,7 +353,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         uint256 amount = claimTotal - claimedTotal;
         unclaimedReleased = true;
         if (amount != 0) {
-            if (to == address(0)) IMD6900(token).burn(amount);
+            if (to == address(this)) excessHeld += amount;
+            else if (to == address(0)) IMD6900(token).burn(amount);
             else SafeTransferLib.safeTransfer(token, to, amount);
         }
         emit UnclaimedReleased(to, amount);
@@ -362,13 +389,21 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     }
 
     /// @notice Sends ETH held here to `to` (all of it with 0), at any time, behind the timelock's delay: the escape
-    ///         hatch for the fees (a payee that refused its share, a split to stop)
+    ///         hatch for the fees (a payee that refused its share, a split to stop). What is not booked goes first;
+    ///         beyond it, the refused shares' books are cancelled (all of them), then the $IMD bucket shrinks.
     function recoverEth(address to, uint256 amount) external nonReentrant {
         if (msg.sender != timelock) revert NotTimelock();
         if (amount == 0) amount = address(this).balance;
         if (amount == 0) revert NoEth();
         SafeTransferLib.safeTransferETH(to, amount);
-        if (imdBucket > address(this).balance) imdBucket = address(this).balance;
+        uint256 left = address(this).balance;
+        if (imdBucket + owedTotal > left) {
+            if (owedTotal != 0) {
+                emit OwedCancelled(owedTotal);
+                (owedTotal, _owedEpoch) = (0, _owedEpoch + 1);
+            }
+            if (imdBucket > left) imdBucket = left;
+        }
         emit EthRecovered(to, amount);
     }
 
@@ -376,6 +411,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     ///         behind the timelock's delay, public for all of it
     function releaseExcess(uint256 amount, address to) external nonReentrant {
         if (msg.sender != timelock) revert NotTimelock();
+        if (to == address(this)) revert BadTo(); // it is here already
         if (amount == 0) amount = excessHeld;
         if (amount == 0 || amount > excessHeld) revert ZeroAmount();
         excessHeld -= amount;
@@ -455,34 +491,56 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         emit Claimed(msg.sender, amount);
     }
 
-    /// @notice Pays the ETH here (beyond what is set aside for $IMD) to the payees, pro rata; the burn executor's share
-    ///         is set aside for {burnImd} instead. After the launch only. A payee that refuses its share leaves it here
-    ///         for the next split.
+    /// @notice Pays the ETH here (beyond what is set aside for $IMD and what is booked to payees) to the payees, pro
+    ///         rata; the burn executor's share is set aside for {burnImd} instead. After the launch only. A payee that
+    ///         refuses its share has it booked to it ({owed}): the next split offers it again with its new share, and
+    ///         nobody else's split ever includes it.
     function split() public nonReentrant returns (uint256 amount) {
         if (token == address(0)) revert NotLaunched();
-        amount = address(this).balance - imdBucket;
+        amount = address(this).balance - imdBucket - owedTotal;
         if (amount == 0) return 0;
         (address[] memory to, uint16[] memory bps) = payees();
         for (uint256 i; i < to.length; ++i) {
             uint256 part = (amount * bps[i]) / 10_000;
-            if (part == 0) continue;
             if (to[i] == imdBurn) {
                 imdBucket += part;
                 continue;
             }
-            (bool ok,) = to[i].call{value: part}("");
-            if (!ok) emit PayFailed(to[i], part);
+            uint256 due = owed(to[i]);
+            uint256 pay = part + due;
+            if (pay == 0) continue;
+            (bool ok,) = to[i].call{value: pay}("");
+            if (ok) {
+                if (due != 0) {
+                    owedTotal -= due;
+                    _owed[_owedEpoch][to[i]] = 0;
+                }
+            } else {
+                owedTotal += part;
+                _owed[_owedEpoch][to[i]] = pay;
+                emit PayFailed(to[i], pay);
+            }
         }
         emit Split(amount);
     }
 
-    /// @notice Buys $IMD with what is set aside for its burn, one buy of at most {IMD_BUY_MAX} per block, and sends it
-    ///         to IMD's burn executor (anyone can then bridge it to Base, where it is destroyed). Anyone. An incomplete
-    ///         fill reverts, keeping all of the unspent ETH reserved for the burn.
+    /// @notice Buys $IMD with what is set aside for its burn, one buy of at most {IMD_BUY_MAX} per block (less on a
+    ///         thin pool: the buy moves the price by less than the pool's fee, so a sandwich around it pays more in fees
+    ///         than it takes), and sends it to IMD's burn executor (anyone can then bridge it to Base, where it is
+    ///         destroyed). Anyone. An incomplete fill reverts, keeping all of the unspent ETH reserved for the burn.
     /// @param minImd the least $IMD the buy may return
     function burnImd(uint256 minImd) external nonReentrant returns (uint256 imd) {
         if (block.number < nextImdBurnBlock) revert BurnRateLimited();
         uint256 spend = imdBucket < IMD_BUY_MAX ? imdBucket : IMD_BUY_MAX;
+        PoolId id = imdPoolKey().toId();
+        uint128 inRange = poolManager.getLiquidity(id);
+        if (inRange != 0) {
+            // the ETH the in-range liquidity stands for is L * 2^96 / sqrtP; a buy of x moves the price by about
+            // 2x of it, so x at the fee's fraction of it moves it by half the fee
+            (uint160 sqrtP,,,) = poolManager.getSlot0(id);
+            uint256 cap = FullMath.mulDiv(uint256(inRange) * imdPoolFee, 1 << 96, uint256(sqrtP) * 1_000_000);
+            if (spend > cap) spend = cap;
+        }
         if (spend == 0) revert NoEth();
         nextImdBurnBlock = block.number + 1;
         imdBucket -= spend;

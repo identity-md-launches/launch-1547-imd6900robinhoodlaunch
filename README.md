@@ -43,9 +43,13 @@ The road to the pot, end to end (each step anyone's to call; `script/launch.sh p
 `burnImd(min)` for the $IMD share, the pot bridge's `bridge()` (Robinhood → Across → Ethereum, from 0.05 ETH), then on
 Ethereum the pot hook's `depositBridgedFees()` (`0xA160…6444`), which adds it to the NFT pot: the strategy buys
 identity.md NFTs at the floor with it, and what it resells them for buys IMD6900 on Ethereum. Rehearsed on forks of
-both chains: 0.1 ETH bridged over Across, then 0.0995 into the pot. The split is the Robinhood timelock's to change (`setPayees`, 12h public delay).
+both chains: 0.1 ETH bridged over Across, then 0.0995 into the pot. The split is the Robinhood timelock's to change (`setPayees`, 12h public delay). A payee that refuses its share (a
+paused bridge) has it booked to it (`owed(payee)`): the next split offers it again with its new share, and no other
+payee's split ever includes it; the timelock's `recoverEth` cancels the books when it reaches into them.
 
-`burnImd` permits one successful buy of at most 0.1 ETH per `block.number`, shared by all callers. Repeating it within
+`burnImd` permits one successful buy of at most 0.1 ETH per `block.number`, shared by all callers, and less on a thin
+pool: the buy is sized so its price impact stays under the pool's fee (1% of the ETH the in-range liquidity stands for),
+so a sandwich around it pays more in fees than it takes, whatever `minImd` the caller passes. Repeating it within
 that block reverts; `nextImdBurnBlock()` reports when another buy is allowed. An incomplete fill or a failed `minImd`
 check reverts the entire buy, preserving both the burn reserve and the ability to retry. This cap limits batching;
 it is not an oracle or a guarantee against price manipulation. See `ADAPTATION.md` for the reproduced audit findings.
@@ -62,7 +66,9 @@ with a refund-aware engine (PerpSwapLib.swapLeg), then only Uniswap's protocol f
 4.44%, a plain static fee: Uniswap's router quotes the pool on its own (no dynamic fee, no return deltas, not a 0x91
 hook; Programmable's plan opts in to the hook list and Uniswap's API too). A v4 pool's fee can't change, so lowering it
 means a new pool: `lowerFee(newFee)` (the timelock, behind its 12h delay; only ever lower, 0 allowed) initializes the
-ETH / IMD6900 pool at `newFee` at the current price, and moves the whole position there in one unlock. Nothing leaves
+ETH / IMD6900 pool at `newFee` at the current price, and moves the whole position there in one unlock, the same
+liquidity to the wei (v4 rounds what it returns down and what it takes up: the locked pool keeps 1,000 wei of each
+currency back from every collect as the margin, and the earned fees cover it too). Nothing else leaves
 but the old pool's earned fees (to the split, like any `collect`); the old pool is left empty and its swaps revert; the
 new one is routable the same way (the fork test buys through the Universal Router before and after a move to 3.33%).
 
@@ -82,9 +88,13 @@ depends on the price the market left. `script/launch.sh recover` (`END_CLAIMS=1`
 
 - The pool is spot-only until the timelock wires an engine (`setPerpEngine`). Then every swap that isn't the engine's
   own calls its sweep first; a sweep that can't run reverts the swap (no bad debt outranks always-tradeable), so a
-  broken engine halts trading until the timelock (12h) sets `sweepFailOpen` or unwires it.
-- The engine is bound to its pool for good, so `lowerFee` refuses while it has positions open (or can't say); after a
-  move it fails closed until the timelock wires a new engine for the new pool.
+  broken engine halts trading until the timelock (12h) sets `sweepFailOpen` or unwires it. The launch's own swaps
+  (the timelock's `sellHeld`) run no sweep either: a liquidation nested inside its fee-refund window would take the
+  sale's refund; what the sale sinks, the next trade's sweep closes.
+- The engine is bound to its pool for good, so `lowerFee` refuses while it has positions open (or can't say), and
+  `setPerpEngine` refuses to unwire or replace an engine that reports positions open (one that can't say is replaceable:
+  the way out of a broken or mistaken wiring); after a move it fails closed until the timelock wires a new engine for
+  the new pool.
 - The locked position holds no liquidity below the opening price: the coin can't trade under the opening market cap,
   and sells past it fill partly. The engine's no-bad-debt pricing must treat that edge as zero depth.
 

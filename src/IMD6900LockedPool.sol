@@ -12,6 +12,7 @@ import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 
 interface IFeeSink {
@@ -55,6 +56,9 @@ contract IMD6900LockedPool is ReentrancyGuard {
     uint8 internal constant OPEN = 0;
     uint8 internal constant COLLECT = 1;
     uint8 internal constant MOVE = 2;
+    /// @dev What stays here of each currency: the rounding margin {lowerFee}'s move needs (a wei of each per move,
+    ///      {_move}); any fee tops it up
+    uint256 internal constant MARGIN = 1_000;
     /// @dev Transient: a refunded caller's open checkpoint in this transaction, one slot per caller
     bytes32 internal constant CHECKPOINT_SEED = keccak256("IMD6900LockedPool.checkpoint");
 
@@ -124,7 +128,7 @@ contract IMD6900LockedPool is ReentrancyGuard {
 
     /// @notice Opens the pool once: initializes it at `sqrtPriceX96` rounded down onto a tick, and puts `amount` of
     ///         the launcher's IMD6900 (approved) into the range from the lowest price up to that tick. What the
-    ///         liquidity can't take (rounding dust) goes back to the launcher.
+    ///         liquidity can't take (rounding dust) goes back to the launcher, but for {MARGIN} wei.
     function open(address token_, uint160 sqrtPriceX96, uint256 amount) external nonReentrant returns (uint128 liq) {
         if (msg.sender != launcher) revert OnlyLauncher();
         if (hook == address(0)) revert NoHook();
@@ -141,10 +145,12 @@ contract IMD6900LockedPool is ReentrancyGuard {
         // every coin sits below the price: amount1 = L * (sqrt(upper) - sqrt(lower)) / 2^96, rounded down
         uint256 l = FullMath.mulDiv(amount, 1 << 96, start - low);
         if (l <= 1) revert ZeroLiquidity();
+        if (l - 1 > type(uint128).max) revert BadPrice(); // too low a price for one position to hold the amount
         liq = uint128(l - 1);
         liquidity = liq;
         (, uint256 used) = abi.decode(poolManager.unlock(abi.encode(OPEN, liq)), (uint256, uint256));
-        if (amount > used) SafeTransferLib.safeTransfer(token_, msg.sender, amount - used);
+        uint256 back = amount - used;
+        if (back > MARGIN) SafeTransferLib.safeTransfer(token_, msg.sender, back - MARGIN); // {_payOutHeld}
         emit Opened(start, upper, used, liq);
     }
 
@@ -255,17 +261,38 @@ contract IMD6900LockedPool is ReentrancyGuard {
     /*                              INTERNAL                                */
 
     function _move(PoolKey memory old) internal returns (bytes memory) {
-        (BalanceDelta out, BalanceDelta earned) = _modifyLiquidity(old, -int256(uint256(liquidity)));
-        // the position's own amounts (without the fees it earned), as liquidity in the same range at the same price
-        uint256 eth = uint256(int256(out.amount0() - earned.amount0()));
-        uint256 coins = uint256(int256(out.amount1() - earned.amount1()));
-        uint128 liq = _liquidityFor(eth, coins);
+        uint128 liq = liquidity;
+        (BalanceDelta out,) = _modifyLiquidity(old, -int256(uint256(liq)));
+        // the same liquidity again, in the same range at the same price. v4 rounds what a position returns down and
+        // what one takes up, so the new position may need a wei more of either than the old one returned: the old
+        // pool's earned fees (in `out`) or the margin kept here ({_payOutHeld}) cover it. Only if neither can
+        // (nothing earned, nothing kept) does the liquidity drop to what the amounts hold.
+        uint256 eth = uint256(uint128(out.amount0())) + address(this).balance;
+        uint256 coins = uint256(uint128(out.amount1())) + SafeTransferLib.balanceOf(token, address(this));
+        (uint256 need0, uint256 need1) = _amountsFor(liq);
+        if (need0 > eth || need1 > coins) liq = _liquidityFor(eth, coins);
         if (liq == 0) revert ZeroLiquidity();
         (BalanceDelta into,) = _modifyLiquidity(poolKey(), int256(uint256(liq)));
-        int128 net0 = out.amount0() + into.amount0(); // what's left: never below zero, the liquidity was rounded down
+        int128 net0 = out.amount0() + into.amount0(); // what's left (the fees), or the wei the position needed
         int128 net1 = out.amount1() + into.amount1();
         _settle(net0, net1);
         return abi.encode(_abs(net0), _abs(net1), liq);
+    }
+
+    /// @dev What v4 takes for `liq` in the position's range at the current price, rounded up as it rounds (Pool.sol's
+    ///      modifyLiquidity, by tick)
+    function _amountsFor(uint128 liq) internal view returns (uint256 eth, uint256 coins) {
+        (uint160 p, int24 tick,,) = poolManager.getSlot0(poolKey().toId());
+        uint160 a = TickMath.getSqrtPriceAtTick(LOWER_TICK);
+        uint160 b = TickMath.getSqrtPriceAtTick(upperTick);
+        if (tick < LOWER_TICK) {
+            eth = SqrtPriceMath.getAmount0Delta(a, b, liq, true);
+        } else if (tick < upperTick) {
+            eth = SqrtPriceMath.getAmount0Delta(p, b, liq, true);
+            coins = SqrtPriceMath.getAmount1Delta(a, p, liq, true);
+        } else {
+            coins = SqrtPriceMath.getAmount1Delta(a, b, liq, true);
+        }
     }
 
     function _modifyLiquidity(PoolKey memory key, int256 delta) internal returns (BalanceDelta, BalanceDelta) {
@@ -305,10 +332,13 @@ contract IMD6900LockedPool is ReentrancyGuard {
     }
 
     /// @dev Everything this contract holds is fees (it never keeps liquidity outside the pool): ETH to the launch's
-    ///      split, IMD6900 burned or to {coinFeeTo}
+    ///      split, IMD6900 burned or to {coinFeeTo}. {MARGIN} wei of each stays behind: the rounding margin
+    ///      {lowerFee}'s move needs to put the whole position back ({_move}).
     function _payOutHeld() internal returns (uint256 eth, uint256 tokens) {
         eth = address(this).balance;
         tokens = SafeTransferLib.balanceOf(token, address(this));
+        eth = eth > MARGIN ? eth - MARGIN : 0;
+        tokens = tokens > MARGIN ? tokens - MARGIN : 0;
         if (eth != 0) IFeeSink(launcher).addFees{value: eth}();
         if (tokens != 0) {
             address to = coinFeeTo;
