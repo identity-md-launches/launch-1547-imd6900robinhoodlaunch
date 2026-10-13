@@ -1,0 +1,15 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "IMD6900RobinhoodLaunch",
+      "constructorArgs": [
+        "0x35da9c0303507ddf708e87f2568eddf12c47a059",
+        "0x8366a39CC670B4001A1121B8F6A443A643e40951",
+        "0x0000198C940D8cD70Cb9ACeC5E3af8216ac57d2F",
+        "0x16D3f65B708883DF042d98E1C7a49B32A33E2A14"
+      ]
+    }
+  ],
+  "notes": "Deploy IMD6900RobinhoodLaunch from src/IMD6900RobinhoodLaunch.sol on Robinhood Chain with the accepted source and compiler settings unchanged. The first argument is the owner, the team wallet 0x35da9c0303507ddf708e87f2568eddf12c47a059, written as the static address the brief states; the remaining arguments are the Uniswap v4 PoolManager, the old IMDSTR token and the Robinhood timelock, in that order. The constructor creates only IMD6900LockedPool, with static POOL_FEE 44400 (4.44%), and requires no salt mining. After deployment, the team separately calls createHook with a salt mined for the launch address and exact hook permissions, excluding addresses starting with 0x91; the timelock owns the hook. Later, the owner calls launch with a mined 0x6900 coin address to create IMD6900, open its permanently locked pool and execute the opening buy. These later operations are not part of this deployment manifest."
+}
