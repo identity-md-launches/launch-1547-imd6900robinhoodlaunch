@@ -45,6 +45,11 @@ Ethereum the pot hook's `depositBridgedFees()` (`0xA160…6444`), which adds it 
 identity.md NFTs at the floor with it, and what it resells them for buys IMD6900 on Ethereum. Rehearsed on forks of
 both chains: 0.1 ETH bridged over Across, then 0.0995 into the pot. The split is the Robinhood timelock's to change (`setPayees`, 12h public delay).
 
+`burnImd` permits one successful buy of at most 0.1 ETH per `block.number`, shared by all callers. Repeating it within
+that block reverts; `nextImdBurnBlock()` reports when another buy is allowed. An incomplete fill or a failed `minImd`
+check reverts the entire buy, preserving both the burn reserve and the ability to retry. This cap limits batching;
+it is not an oracle or a guarantee against price manipulation. See `ADAPTATION.md` for the reproduced audit findings.
+
 ## The fee, and routing
 
 Two callers trade fee-free, by refund: the hook's perps engine and the launch (the timelock's sale of held coins).
@@ -101,7 +106,7 @@ the opening buy's ETH or end the claims early: each visible 12h before it runs.
 ## Tests
 
 ```sh
-forge test                                         # 44 tests, offline: admission, the 0x6900 coin, launch, pool, fees, refunds, the fee's move (never with perps open), $IMD burn, perps fees, claims, the ETH back
+forge test                                         # offline: admission, launch, pool, fees, refunds, lowerFee, burns, claims, recovery, and audit regressions
 ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-contract RobinhoodFork -vv
 ```
 
