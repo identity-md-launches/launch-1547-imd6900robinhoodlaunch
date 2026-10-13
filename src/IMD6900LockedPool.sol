@@ -22,6 +22,12 @@ interface IBurnable {
     function burn(uint256 amount) external;
 }
 
+/// @notice The hook's perps engine, and whether it has positions open
+interface IPerpsWiring {
+    function perpEngine() external view returns (address);
+    function openCount() external view returns (uint256);
+}
+
 /// @title IMD6900LockedPool - the ETH / IMD6900 pool's liquidity on Robinhood Chain, locked for good
 /// @notice Owns the pool's one position. Its launch opens it once, with IMD6900 only: the whole range from the pool's
 ///         lowest price up to the opening price, so the opening needs no ETH and every coin enters the market from
@@ -33,7 +39,8 @@ interface IBurnable {
 ///            Uniswap's routing automatic), so a lower fee is a new pool. This moves the position, in one unlock, from
 ///            the current pool into a fresh one at the lower fee and the same price: the two legs settle against each
 ///            other, nothing is paid out but the old pool's earned fees (to the split and the burn), and the fee can
-///            only ever go down.
+///            only ever go down. Never while the perps engine has positions open: the engine is bound to its pool
+///            for good, so they could no longer close; after a move it fails closed until a new one is wired.
 contract IMD6900LockedPool is ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -75,6 +82,8 @@ contract IMD6900LockedPool is ReentrancyGuard {
     error BadPrice();
     error ZeroLiquidity();
     error NotLower();
+    /// @notice The perps engine has positions open: its pool is fixed for good, so moving the liquidity would strand them
+    error PerpsOpen();
 
     constructor(IPoolManager poolManager_, uint24 fee_, address launcher_, address timelock_) {
         poolManager = poolManager_;
@@ -135,6 +144,12 @@ contract IMD6900LockedPool is ReentrancyGuard {
         if (msg.sender != timelock) revert OnlyTimelock();
         if (token == address(0)) revert NotOpen();
         if (newFee >= fee) revert NotLower();
+        address engine = IPerpsWiring(hook).perpEngine();
+        if (engine != address(0)) {
+            // an engine that can't say how many positions it holds counts as holding some
+            (bool ok, bytes memory ret) = engine.staticcall{gas: 100_000}(abi.encodeCall(IPerpsWiring.openCount, ()));
+            if (!ok || ret.length < 32 || abi.decode(ret, (uint256)) != 0) revert PerpsOpen();
+        }
         PoolKey memory old = poolKey();
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(old.toId());
         uint24 from = fee;

@@ -394,7 +394,6 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         emit HeldSold(sold, eth, to);
     }
 
-    /// @notice Repoints $IMD's buys to another of its Robinhood pools (ETH / $IMD), behind the timelock's delay
     /// @notice Repoints the $IMD share to another burn executor (set the payees again if they name the old one)
     function setImdBurn(address executor) external {
         if (msg.sender != timelock) revert NotTimelock();
@@ -411,6 +410,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         emit PerpFeeToSet(to);
     }
 
+    /// @notice Repoints $IMD's buys to another of its Robinhood pools (ETH / $IMD), behind the timelock's delay
     function setImdPool(uint24 fee, int24 tickSpacing, address hooks) external {
         if (msg.sender != timelock) revert NotTimelock();
         (imdPoolFee, imdPoolTickSpacing, imdPoolHooks) = (fee, tickSpacing, hooks);

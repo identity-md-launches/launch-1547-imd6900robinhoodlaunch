@@ -72,6 +72,15 @@ contract Engine is Trader {
     function openCount() external pure returns (uint256) { return 0; }
 }
 
+/// A perps engine whose open positions the test sets (and one that can't say)
+contract CountingEngine {
+    uint256 public openCount;
+    bool public broken;
+    function set(uint256 n, bool b) external { (openCount, broken) = (n, b); }
+    function sweepLiquidations(address, int256, bool, uint160) external pure returns (uint8) { return 0; }
+    fallback() external { revert(); }
+}
+
 /// Puts full-range liquidity in a plain pool (the stand-in for $IMD's pool on Robinhood)
 contract LiquidityAdder {
     IPoolManager immutable pm; PoolKey key; uint256 liq;
@@ -510,6 +519,26 @@ contract IMD6900RobinhoodLaunchTest is Test {
         trader.swap(pool.poolKey(), true, -1 ether);
         (uint256 eth,) = pool.collect();
         assertEq(eth, 0);
+    }
+
+    function test_NoFeeMoveWhilePerpsAreOpen() public {
+        _launch();
+        CountingEngine engine = new CountingEngine();
+        vm.prank(TL);
+        hook.setPerpEngine(address(engine));
+        engine.set(3, false); // positions open: the engine's pool is fixed for good, a move would strand them
+        vm.prank(TL);
+        vm.expectRevert(IMD6900LockedPool.PerpsOpen.selector);
+        pool.lowerFee(33_300);
+        vm.etch(address(engine), hex"fe"); // an engine that can't even say counts as holding positions
+        vm.prank(TL);
+        vm.expectRevert(IMD6900LockedPool.PerpsOpen.selector);
+        pool.lowerFee(33_300);
+        vm.etch(address(engine), type(CountingEngine).runtimeCode);
+        engine.set(0, false); // every position closed
+        vm.prank(TL);
+        pool.lowerFee(33_300);
+        assertEq(pool.fee(), 33_300, "with nothing open the move goes through");
     }
 
     function test_ThePerpsEngineTradesThroughTheHook() public {

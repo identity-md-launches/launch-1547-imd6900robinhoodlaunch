@@ -63,6 +63,16 @@ through the split: on a fork, 2.54 ETH for the 2.77 spent, ~92% of the 2.81 with
 the split pointed at the team for that harvest); the excess alone, claims kept, ~1.3 ETH. Later, it depends on the price the market left.
 `script/launch.sh recover` (`END_CLAIMS=1` for the reserve too) queues it, `recover-exec` runs it.
 
+## Perps: what the engine (its own audit and deploy, later) must respect
+
+- The pool is spot-only until the timelock wires an engine (`setPerpEngine`). Then every swap that isn't the engine's
+  own calls its sweep first; a sweep that can't run reverts the swap (no bad debt outranks always-tradeable), so a
+  broken engine halts trading until the timelock (12h) sets `sweepFailOpen` or unwires it.
+- The engine is bound to its pool for good, so `lowerFee` refuses while it has positions open (or can't say); after a
+  move it fails closed until the timelock wires a new engine for the new pool.
+- The locked position holds no liquidity below the opening price: the coin can't trade under the opening market cap,
+  and sells past it fill partly. The engine's no-bad-debt pricing must treat that edge as zero depth.
+
 ## The liquidity: locked, its fees not
 
 The position belongs to `IMD6900LockedPool`, which has no owner and no function that takes liquidity out to anyone:
@@ -81,7 +91,7 @@ the opening buy's ETH or end the claims early: each visible 12h before it runs.
 ## Tests
 
 ```sh
-forge test                                         # 39 tests, offline: admission, the 0x6900 coin, launch, pool, fees, the fee's move, $IMD burn, perps fees, claims, the ETH back
+forge test                                         # 40 tests, offline: admission, the 0x6900 coin, launch, pool, fees, the fee's move (never with perps open), $IMD burn, perps fees, claims, the ETH back
 ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-contract RobinhoodFork -vv
 ```
 
