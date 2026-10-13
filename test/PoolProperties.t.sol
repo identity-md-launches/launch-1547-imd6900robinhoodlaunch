@@ -80,7 +80,12 @@ contract RefundProtocolTest is LaunchFixture {
         assertEq(coins, 0);
         assertEq(address(engine).balance, beforeEngine);
         (uint256 fees,) = locked.collect();
-        assertApproxEqAbs(fees, (OPENING_BUY + 1 ether) * 444 / 10_000, 2);
+        // the first collect keeps the MARGIN wei of ETH back; everything else earned so far is paid out
+        assertApproxEqAbs(fees + MARGIN, (OPENING_BUY + 1 ether) * 444 / 10_000, 2);
+        assertEq(address(locked).balance, MARGIN, "exactly the margin stays");
+        (uint256 again,) = locked.collect();
+        assertEq(again, 0, "a second collect with nothing earned pays nothing and keeps the margin");
+        assertEq(address(locked).balance, MARGIN);
     }
 
     function test_RefundCannotBeReplayedAndFailedReplayRollsBackSwap() public {
@@ -127,7 +132,9 @@ contract RefundProtocolTest is LaunchFixture {
         assertEq(address(engine).balance, 10 ether - amount + refund);
         trader.swap(locked.poolKey(), true, -1 ether);
         (uint256 ordinaryFees,) = locked.collect();
-        assertApproxEqAbs(ordinaryFees, (OPENING_BUY + 2 ether) * 444 / 10_000, 4);
+        // the refund never reaches the margin: the first collect keeps it back from the ordinary fees only
+        assertApproxEqAbs(ordinaryFees + MARGIN, (OPENING_BUY + 2 ether) * 444 / 10_000, 4);
+        assertEq(address(locked).balance, MARGIN);
     }
 }
 
@@ -153,12 +160,14 @@ contract LockedPoolPropertyTest is LaunchFixture {
         assertLt(requested - upper, 60, "rounds down, including negative ticks");
         assertEq(actualPrice, TickMath.getSqrtPriceAtTick(upper));
         assertEq(address(manager).balance, 0, "opening liquidity needs no ETH");
-        assertEq(token.balanceOf(address(locked)), 0, "no principal stays outside the pool");
+        uint256 kept = token.balanceOf(address(locked));
+        assertLe(kept, MARGIN, "at most the rounding margin stays outside the pool");
         uint256 dust = token.balanceOf(address(launch));
+        if (kept < MARGIN) assertEq(dust, 0, "the margin is filled before anything goes back");
         // Subtracting one unit of liquidity leaves at most one liquidity unit
         // plus rounding, measured in tokens at the opening square-root price.
-        assertLe(dust, (uint256(actualPrice) >> 96) * 2 + 2);
-        assertEq(token.balanceOf(address(manager)) + dust, SUPPLY);
+        assertLe(dust + kept, (uint256(actualPrice) >> 96) * 2 + 2);
+        assertEq(token.balanceOf(address(manager)) + dust + kept, SUPPLY);
         assertEq(token.totalSupply(), SUPPLY);
         (uint128 position,,) = manager.getPositionInfo(locked.poolId(), address(locked), locked.LOWER_TICK(), upper, 0);
         assertEq(position, locked.liquidity());
@@ -189,7 +198,9 @@ contract LockedPoolPropertyTest is LaunchFixture {
     {
         _start();
         uint24 nextFee = uint24(bound(feeSeed, 0, 44_399));
-        uint256 buy = bound(seed, 1, 10 ether);
+        // from 0.01 ETH the buy's fee exceeds the margin the locked pool keeps back, so some of it must reach the
+        // launch at the move; the wei-sized edge is pinned by test_MoveWithFeesBelowTheMarginKeepsThemAll
+        uint256 buy = bound(seed, 0.01 ether, 10 ether);
         trader.swap(locked.poolKey(), true, -int256(buy));
         uint256 tokens = coin.balanceOf(address(trader));
         if (tokens > 1) trader.swap(locked.poolKey(), false, -int256(tokens / 2));
@@ -199,18 +210,33 @@ contract LockedPoolPropertyTest is LaunchFixture {
         uint256 held = coin.balanceOf(address(launch));
         uint256 reserve = launch.claimReserve();
         uint256 launchEth = address(launch).balance;
+        uint256 marginCoins = coin.balanceOf(address(locked));
+        uint256 managerCoins = coin.balanceOf(address(manager));
+        uint256 supply = coin.totalSupply();
         vm.prank(TIMELOCK);
         uint128 moved = locked.lowerFee(nextFee);
         (uint160 nextPrice,, uint128 active) = locked.state();
         assertEq(price, nextPrice);
         assertEq(moved, active);
-        assertApproxEqRel(moved, liquidity, 1e9);
+        if (tokens > 1 && marginCoins == MARGIN) {
+            // fees were earned in both currencies and the coin margin is full: the rounding wei the new position
+            // may need is covered, so the whole position moves to the unit of liquidity
+            assertEq(moved, liquidity, "the margin covers the rounding: nothing of the position is lost");
+        } else {
+            assertApproxEqRel(moved, liquidity, 1e9);
+        }
         assertEq(manager.getLiquidity(old.toId()), 0);
         assertEq(coin.balanceOf(address(launch)), held);
         assertEq(launch.claimReserve(), reserve);
         assertGt(address(launch).balance, launchEth, "old ETH fees reach the launch");
-        assertEq(address(locked).balance, 0);
-        assertEq(coin.balanceOf(address(locked)), 0);
+        assertLe(address(locked).balance, MARGIN, "only the margin stays behind");
+        assertLe(coin.balanceOf(address(locked)), MARGIN);
+        // what left the manager and the locked pool in coins was burned, nothing else: no coins to anyone
+        assertEq(
+            managerCoins + marginCoins - coin.balanceOf(address(manager)) - coin.balanceOf(address(locked)),
+            supply - coin.totalSupply(),
+            "coins out of the pool and the margin are burned fees, nothing else"
+        );
         vm.startPrank(TIMELOCK);
         vm.expectRevert(IMD6900LockedPool.NotLower.selector);
         locked.lowerFee(nextFee);
@@ -220,6 +246,33 @@ contract LockedPoolPropertyTest is LaunchFixture {
         trader.swap(locked.poolKey(), true, -1 ether);
         (uint256 fees,) = locked.collect();
         assertApproxEqAbs(fees, uint256(nextFee) * 1 ether / 1_000_000, 2);
+    }
+
+    /// A move whose earned fees are smaller than the margin pays nothing out: the few wei stay as margin. The
+    /// position still moves whole, and the next payout is only what exceeds the margin.
+    function test_MoveWithFeesBelowTheMarginKeepsThemAll() public {
+        _start();
+        locked.collect(); // the opening buy's fee is out; the margin is full
+        assertEq(address(locked).balance, MARGIN);
+        trader.swap(locked.poolKey(), true, -1); // one wei in: a one-wei fee, no price move
+        uint128 liquidity = locked.liquidity();
+        uint256 launchEth = address(launch).balance;
+        uint256 supply = coin.totalSupply();
+        vm.prank(TIMELOCK);
+        uint128 moved = locked.lowerFee(33_300);
+        assertLe(address(launch).balance - launchEth, 1, "the one-wei fee at most: nothing of the margin");
+        assertLe(address(locked).balance, MARGIN);
+        assertGe(address(locked).balance, MARGIN - 1, "the move spends at most a wei of the margin");
+        assertGe(moved, liquidity - 1, "the position moves whole, or a unit short where nothing covers the rounding");
+        assertEq(coin.totalSupply(), supply, "no coin fee beyond the margin to burn");
+        uint256 kept = address(locked).balance;
+        vm.deal(address(this), 2 * MARGIN);
+        (bool ok,) = address(locked).call{value: 2 * MARGIN}("");
+        assertTrue(ok);
+        (uint256 eth,) = locked.collect();
+        assertEq(address(locked).balance, MARGIN, "a payout leaves exactly the margin");
+        assertEq(eth, kept + MARGIN, "everything beyond the margin, the few kept wei included, goes to the launch");
+        assertEq(address(launch).balance, launchEth + kept + MARGIN);
     }
 
     function test_StandaloneCreationAndRuntimeOpcodesMeetAdmissionRule() public {

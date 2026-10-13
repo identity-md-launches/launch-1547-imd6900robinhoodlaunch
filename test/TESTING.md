@@ -9,12 +9,23 @@ The existing deployment, admission, launch, audit-regression and Robinhood-fork 
 | `PoolProperties.t.sol` | Checkpoint authorization, replay and caller isolation; fee-refund attribution; coin-only opening and negative tick rounding; buy/sell round trips; fee-migration conservation; creation and runtime opcode scans for all four application contracts. |
 | `LaunchInvariant.t.sol` | Stateful custody and liquidity properties under mixed call sequences. |
 
-The invariant handler targets 20 distinct actions, with extra weight on claiming. It uses three claimants, an ordinary trader, a refunding engine, the team and the timelock. It interleaves claims, transfers, burns, donations, buys, sells, checkpoints/refunds, fee collections, fee moves, burn buys, recovery, release and closure. Expected failures are checked explicitly. Unexpected handler reverts fail the campaign.
+## Revision against the fee-refund source
 
-The three global invariants check:
+The source now keeps a 1,000 wei margin of each currency in the locked pool (the rounding cover for `lowerFee`'s move), books a refusing payee's share to it (`owed`), lets `recoverEth` cancel those books, keeps a release to the launch itself as held excess, refuses `renounceOwnership` and `releaseExcess` to the launch, caps `burnImd` on a thin pool, refuses `setPerpEngine` while positions are open, and skips the liquidation sweep for the launch's own sale. The tests of this round were updated to those semantics rather than rewritten:
+
+- `PoolProperties.t.sol`: every payout leaves exactly the margin (or everything below it); the migration fuzz asserts the whole position moves to the unit when the margin is full, and coin conservation across a move; a move whose fees are below the margin pays nothing out (`test_MoveWithFeesBelowTheMarginKeepsThemAll`).
+- `LaunchInvariant.t.sol`: the handler drives a toggleable refusing payee through `setPayees`, checks every split against the owed ledger, checks `recoverEth`'s cancellation rule, closes claims by every path (`endClaims`, burn, send, keep in the launch), and probes `NoRenounce` and `BadTo`. A fourth invariant keeps the owed total equal to the per-payee books, backed by held ETH beside the burn bucket, with the burn executor never booked and the owner unchanged.
+- `LaunchFailures.t.sol`: a payee removed from the list keeps its books until recovery; a duplicate refusing payee books both parts exactly once and the books are never split to others.
+
+Three low findings are in `.imd-findings.json` (a split with nothing new never pays the books; a removed payee's books are only freed by cancelling all; a zero-fee $IMD pool blocks every burn). They are reported, not asserted as correct.
+
+The invariant handler targets 23 distinct actions, with extra weight on claiming. It uses three claimants, an ordinary trader, a refunding engine, the team and the timelock. It interleaves claims, transfers, burns, donations, buys, sells, checkpoints/refunds, fee collections, fee moves, burn buys, recovery, release and closure. Expected failures are checked explicitly. Unexpected handler reverts fail the campaign.
+
+The four global invariants check:
 
 - **Claims and custody:** independent per-claimant ghosts equal recorded claims; old-token custody plus releases equals claimed coins; launch coin custody backs the claim reserve, held excess and unsolicited donations; claim closure stays final.
 - **Value conservation:** all ETH and token recipients are enumerated, balances conserve value, initial coin supply equals surviving supply plus accounted burns, and reserved IMD-buy ETH remains backed. Burn-executor receipts agree with successful buys.
+- **Refused shares:** the owed total equals the per-payee books, is backed by held ETH beside the burn bucket, the burn executor is never booked, and the owner never changes.
 - **Locked principal:** the actual v4 position equals recorded liquidity, meaningful principal cannot disappear during fee moves, the hook serves the current pool, and every retired pool remains empty.
 
 Settings travel in Solidity comments: **256 invariant sequences of depth 80**, with `fail-on-revert = true`, and **1,000 cases for each new stateless fuzz test**. A deterministic mixed sequence checks that the handler successfully reaches claims, spot trades, refunds, collection and migration.

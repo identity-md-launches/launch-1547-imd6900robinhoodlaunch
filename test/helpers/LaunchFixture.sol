@@ -27,6 +27,9 @@ abstract contract LaunchFixture is Test {
     uint256 internal constant OPENING_BUY = 3 ether;
     // Aligned tick, approximately the existing fixture's opening market cap.
     int24 internal constant OPENING_TICK = 177_660;
+    // IMD6900LockedPool.MARGIN: the wei of each currency the locked pool keeps back from every payout as the
+    // rounding margin for lowerFee's move. Internal there, so it is restated here and checked by the tests.
+    uint256 internal constant MARGIN = 1_000;
 
     IPoolManager internal manager;
     IMD6900RobinhoodLaunch internal launch;

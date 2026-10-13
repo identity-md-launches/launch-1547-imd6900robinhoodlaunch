@@ -13,6 +13,19 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 
+/// A payee that refuses its share until told to accept: what split books to it ({owed}) is the ledger under test
+contract TogglePayee {
+    bool public refusing = true;
+
+    function setRefusing(bool r) external {
+        refusing = r;
+    }
+
+    receive() external payable {
+        if (refusing) revert("refused");
+    }
+}
+
 /// Actions use bounded balances, not vm.deal on application contracts. Reverts
 /// are failures unless explicitly expected; ghost updates follow successful calls.
 contract LaunchSequenceHandler is Test {
@@ -44,6 +57,12 @@ contract LaunchSequenceHandler is Test {
     uint256 public refundsExecuted;
     uint256 public collectionsExecuted;
     uint256 public migrationsExecuted;
+    uint256 public refusalsBooked;
+    uint256 public booksCancelled;
+    uint256 internal constant MARGIN = 1_000;
+    /// the refusing payee, and every address the split can book ETH to while it runs
+    TogglePayee public immutable refuser = new TogglePayee();
+    address[] public payeesSeen;
 
     constructor(
         IMD6900RobinhoodLaunch launch_,
@@ -61,6 +80,76 @@ contract LaunchSequenceHandler is Test {
         team = launch_.owner();
         timelock = launch_.timelock();
         (legacy, trader, engine, actors, allocations) = (legacy_, trader_, engine_, actors_, allocations_);
+        payeesSeen.push(launch_.POT_BRIDGE());
+        payeesSeen.push(address(refuser));
+        payeesSeen.push(actors_[1]);
+    }
+
+    /// The split's payees: the defaults, or a list with the refusing payee in it (a plain EOA beside it). The $IMD
+    /// burn executor keeps its 10% in every list, as the real split does.
+    function configurePayees(uint8 mode) external {
+        vm.startPrank(timelock);
+        if (mode % 3 == 0) {
+            address[] memory to = new address[](2);
+            uint16[] memory bps = new uint16[](2);
+            (to[0], bps[0], to[1], bps[1]) = (launch.POT_BRIDGE(), 9_000, launch.imdBurn(), 1_000);
+            launch.setPayees(to, bps);
+        } else if (mode % 3 == 1) {
+            address[] memory to = new address[](3);
+            uint16[] memory bps = new uint16[](3);
+            (to[0], bps[0]) = (address(refuser), 5_000);
+            (to[1], bps[1]) = (launch.POT_BRIDGE(), 4_000);
+            (to[2], bps[2]) = (launch.imdBurn(), 1_000);
+            launch.setPayees(to, bps);
+        } else {
+            address[] memory to = new address[](3);
+            uint16[] memory bps = new uint16[](3);
+            (to[0], bps[0]) = (address(refuser), 4_500);
+            (to[1], bps[1]) = (actors[1], 4_500);
+            (to[2], bps[2]) = (launch.imdBurn(), 1_000);
+            launch.setPayees(to, bps);
+        }
+        vm.stopPrank();
+    }
+
+    function toggleRefusal(bool refusing) external {
+        refuser.setRefusing(refusing);
+    }
+
+    /// What the owed ledger must do on every split: a payee that refuses has its part booked, one that accepts is
+    /// paid its part and everything booked to it, and the burn's share is never booked.
+    function splitChecked() external {
+        uint256 balance = address(launch).balance;
+        uint256 bucket = launch.imdBucket();
+        uint256 owedBefore = launch.owedTotal();
+        uint256 refuserOwed = launch.owed(address(refuser));
+        uint256 refuserBalance = address(refuser).balance;
+        (address[] memory to, uint16[] memory bps) = launch.payees();
+        uint256 refuserBps;
+        for (uint256 i; i < to.length; ++i) {
+            if (to[i] == address(refuser)) refuserBps += bps[i];
+        }
+        uint256 amount = launch.split();
+        assertEq(amount, balance - bucket - owedBefore, "the split is what is neither reserved nor booked");
+        uint256 part = amount * refuserBps / 10_000;
+        if (amount == 0) {
+            // split returns before the payee loop when there is nothing new: what is booked is not offered until
+            // new ETH arrives (reported in .imd-findings.json as a liveness nit, not asserted correct here)
+            assertEq(launch.owed(address(refuser)), refuserOwed);
+            assertEq(address(refuser).balance, refuserBalance);
+        } else if (refuserBps == 0) {
+            assertEq(launch.owed(address(refuser)), refuserOwed, "a payee off the list is neither paid nor booked");
+        } else if (refuser.refusing()) {
+            if (part + refuserOwed != 0) {
+                assertEq(launch.owed(address(refuser)), refuserOwed + part, "the refused part joins the books");
+                assertEq(address(refuser).balance, refuserBalance);
+                if (part != 0) ++refusalsBooked;
+            }
+        } else {
+            assertEq(address(refuser).balance, refuserBalance + part + refuserOwed, "paid its part and its books");
+            assertEq(launch.owed(address(refuser)), 0);
+        }
+        assertEq(launch.imdBucket(), bucket + amount * 1_000 / 10_000, "the burn's 10%, never booked");
     }
 
     function claim(uint256 actorSeed, uint256 amountSeed) external {
@@ -146,11 +235,18 @@ contract LaunchSequenceHandler is Test {
         uint256 balance = address(launch).balance;
         address recipient = locked.coinFeeTo();
         uint256 recipientBefore = coin.balanceOf(recipient);
+        uint256 ethHeld = address(locked).balance;
+        uint256 coinsHeld = coin.balanceOf(address(locked));
         (uint256 eth, uint256 coins) = locked.collect();
         ++collectionsExecuted;
         assertEq(address(launch).balance - balance, eth);
-        assertEq(address(locked).balance, 0);
-        assertEq(coin.balanceOf(address(locked)), 0);
+        // the margin: a payout leaves exactly MARGIN when there was at least that much, all of it otherwise
+        assertLe(address(locked).balance, MARGIN);
+        assertLe(coin.balanceOf(address(locked)), MARGIN);
+        if (eth != 0) assertEq(address(locked).balance, MARGIN, "paying out leaves the full margin");
+        if (coins != 0) assertEq(coin.balanceOf(address(locked)), MARGIN);
+        assertGe(address(locked).balance, ethHeld > MARGIN ? MARGIN : ethHeld, "a collect never eats the margin");
+        assertGe(coin.balanceOf(address(locked)), coinsHeld > MARGIN ? MARGIN : coinsHeld);
         assertEq(locked.liquidity(), liquidity, "collection cannot remove principal");
         if (recipient == address(0)) {
             ghostBurned += coins;
@@ -178,17 +274,36 @@ contract LaunchSequenceHandler is Test {
         uint256 supply = coin.totalSupply();
         address recipient = locked.coinFeeTo();
         uint256 recipientBefore = coin.balanceOf(recipient);
+        uint256 launchEth = address(launch).balance;
+        uint256 heldEth = address(locked).balance;
+        uint256 managerEth = address(manager).balance;
         vm.prank(timelock);
         uint128 newLiquidity = locked.lowerFee(next);
         retiredPools.push(previous.toId());
         ++migrationsExecuted;
-        uint256 releasedCoins = managerCoins - coin.balanceOf(address(manager)) + heldCoins;
+        // coins: what the manager and the locked pool held together is what they hold now plus what was paid out,
+        // burned or sent to the fee recipient; nobody else receives a coin during a move
+        uint256 releasedCoins =
+            recipient == address(0) ? supply - coin.totalSupply() : coin.balanceOf(recipient) - recipientBefore;
         if (recipient == address(0)) {
             ghostBurned += releasedCoins;
-            assertEq(supply - coin.totalSupply(), releasedCoins);
         } else {
-            assertEq(coin.balanceOf(recipient) - recipientBefore, releasedCoins);
             assertEq(coin.totalSupply(), supply);
+        }
+        assertEq(
+            managerCoins + heldCoins,
+            coin.balanceOf(address(manager)) + coin.balanceOf(address(locked)) + releasedCoins,
+            "a move pays out fees only"
+        );
+        assertEq(
+            managerEth + heldEth,
+            address(manager).balance + address(locked).balance + (address(launch).balance - launchEth),
+            "a move's ETH goes to the pool, the margin or the launch"
+        );
+        assertLe(address(locked).balance, MARGIN, "the move leaves at most the margin");
+        assertLe(coin.balanceOf(address(locked)), MARGIN);
+        if (heldEth >= MARGIN && heldCoins >= MARGIN) {
+            assertEq(newLiquidity, oldLiquidity, "with a full margin the whole position moves, to the unit");
         }
         (uint160 afterPrice,,) = locked.state();
         assertEq(afterPrice, price, "fee move preserves the exact sqrt price");
@@ -222,11 +337,14 @@ contract LaunchSequenceHandler is Test {
         if (burn) ghostBurned += amount;
     }
 
-    function closeClaims(bool early, bool burn) external {
+    function closeClaims(bool early, uint8 mode) external {
         if (ghostClosed) return;
         if (early) {
+            uint256 held = launch.excessHeld();
+            uint256 reserve = launch.claimReserve();
             vm.prank(timelock);
             launch.endClaims();
+            assertEq(launch.excessHeld(), held + reserve, "the unclaimed rest joins the held coins");
         } else {
             if (block.timestamp < launch.claimDeadline()) {
                 vm.prank(team);
@@ -235,11 +353,18 @@ contract LaunchSequenceHandler is Test {
                 return;
             }
             uint256 reserve = launch.claimReserve();
+            uint256 held = launch.excessHeld();
+            address to = mode % 3 == 0 ? address(0) : mode % 3 == 1 ? actors[0] : address(launch);
             vm.prank(team);
-            launch.releaseUnclaimed(burn ? address(0) : actors[0]);
-            if (burn) ghostBurned += reserve;
+            launch.releaseUnclaimed(to);
+            if (to == address(0)) ghostBurned += reserve;
+            // released to the launch itself, the rest is held for the timelock rather than lost to the books
+            assertEq(launch.excessHeld(), to == address(launch) ? held + reserve : held);
         }
         ghostClosed = true;
+        vm.prank(team);
+        vm.expectRevert(IMD6900RobinhoodLaunch.AlreadyReleased.selector);
+        launch.releaseUnclaimed(actors[0]);
     }
 
     function releaseLegacy(uint256 seed) external {
@@ -284,8 +409,23 @@ contract LaunchSequenceHandler is Test {
         uint256 held = address(launch).balance;
         if (held == 0) return;
         uint256 amount = bound(seed, 1, held);
+        uint256 bucket = launch.imdBucket();
+        uint256 owedBefore = launch.owedTotal();
+        uint256 refuserOwed = launch.owed(address(refuser));
         vm.prank(timelock);
         launch.recoverEth(actors[1], amount);
+        uint256 left = held - amount;
+        if (bucket + owedBefore > left) {
+            // beyond the unbooked ETH: every book is cancelled, then the burn's bucket shrinks to what is left
+            assertEq(launch.owedTotal(), 0, "the books are cancelled, all of them");
+            assertEq(launch.owed(address(refuser)), 0);
+            if (owedBefore != 0) ++booksCancelled;
+            assertEq(launch.imdBucket(), bucket > left ? left : bucket);
+        } else {
+            assertEq(launch.owedTotal(), owedBefore, "unbooked ETH goes first: the books stand");
+            assertEq(launch.owed(address(refuser)), refuserOwed);
+            assertEq(launch.imdBucket(), bucket);
+        }
     }
 
     function perpFees(uint256 seed) external {
@@ -326,6 +466,14 @@ contract LaunchSequenceHandler is Test {
             locked.feeRefund(actor);
         }
         vm.stopPrank();
+        // the owner cannot walk away from the claims, and the timelock cannot "release" held coins to the launch itself
+        vm.prank(team);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NoRenounce.selector);
+        launch.renounceOwnership();
+        vm.prank(timelock);
+        vm.expectRevert(IMD6900RobinhoodLaunch.BadTo.selector);
+        launch.releaseExcess(1, address(launch));
+        assertEq(launch.owner(), team);
     }
 
     function _position(PoolId id) internal view returns (uint128 liquidity) {
@@ -392,6 +540,7 @@ contract LaunchInvariantTest is LaunchFixture {
         holders.push(TIMELOCK);
         holders.push(launch.POT_BRIDGE());
         holders.push(launch.IMD_BURN());
+        holders.push(address(handler.refuser()));
         for (uint256 i; i < 3; ++i) {
             holders.push(users[i]);
         }
@@ -400,7 +549,10 @@ contract LaunchInvariantTest is LaunchFixture {
         }
         initialLiquidity = locked.liquidity();
 
-        bytes4[] memory selectors = new bytes4[](21);
+        bytes4[] memory selectors = new bytes4[](24);
+        selectors[21] = handler.configurePayees.selector;
+        selectors[22] = handler.toggleRefusal.selector;
+        selectors[23] = handler.splitChecked.selector;
         selectors[0] = handler.claim.selector;
         selectors[1] = handler.trade.selector;
         selectors[2] = handler.refundedTrade.selector;
@@ -470,6 +622,19 @@ contract LaunchInvariantTest is LaunchFixture {
         assertLe(launch.imdBucket(), address(launch).balance, "burn ETH is always backed");
     }
 
+    /// The owed ledger: what the split booked to refusing payees is backed by ETH held here beside the burn's
+    /// bucket, and the total agrees with the per-payee books of everyone the split could ever have booked.
+    function invariant_RefusedSharesStayBookedAndBacked() public view {
+        uint256 sum;
+        for (uint256 i; i < 3; ++i) {
+            sum += launch.owed(handler.payeesSeen(i));
+        }
+        assertEq(launch.owedTotal(), sum, "the books add up to the total");
+        assertLe(launch.owedTotal() + launch.imdBucket(), address(launch).balance, "booked and reserved ETH is held");
+        assertEq(launch.owed(launch.imdBurn()), 0, "the burn's share is reserved, never booked");
+        assertEq(launch.owner(), TEAM, "the owner never changes nor renounces");
+    }
+
     /// Principal remains a v4 position owned only by the locked pool, including
     /// when the market price is outside its active range.
     function invariant_LiquidityStaysLockedAndRetiredPoolsStayEmpty() public view {
@@ -507,20 +672,36 @@ contract LaunchInvariantTest is LaunchFixture {
         handler.configureCoinFees(false);
         handler.trade(false, 100 ether);
         handler.collect(false);
+        handler.configurePayees(1);
+        handler.donateEth(1 ether, false);
+        handler.splitChecked(); // the refuser's half is booked
+        handler.donateEth(1 ether, false);
+        handler.splitChecked(); // and again, on top
+        handler.toggleRefusal(false);
+        handler.donateEth(1 ether, false);
+        handler.splitChecked(); // paid all of it
+        handler.toggleRefusal(true);
+        handler.donateEth(1 ether, false);
+        handler.splitChecked();
+        handler.recoverEth(type(uint256).max); // all of it: the books are cancelled, the bucket emptied
         handler.releaseLegacy(50 ether);
         handler.sellHeld(100 ether);
         handler.releaseExcess(100 ether, true);
-        handler.closeClaims(true, false);
+        handler.closeClaims(true, 0);
         handler.perpFees(0.1 ether);
-        handler.recoverEth(1);
         handler.rejectedCalls(1, 2);
         invariant_ClaimsAndHeldCoinsStayFullyBacked();
         invariant_ValueIsConservedAndOnlyExplicitBurnsReduceSupply();
         invariant_LiquidityStaysLockedAndRetiredPoolsStayEmpty();
+        invariant_RefusedSharesStayBookedAndBacked();
         assertGt(handler.claimsExecuted(), 0);
         assertGt(handler.tradesExecuted(), 0);
         assertGt(handler.refundsExecuted(), 0);
         assertGt(handler.collectionsExecuted(), 0);
         assertGt(handler.migrationsExecuted(), 0);
+        assertEq(handler.refusalsBooked(), 3);
+        assertEq(handler.booksCancelled(), 1);
+        assertEq(launch.owedTotal(), 0);
+        assertEq(launch.imdBucket(), 0);
     }
 }

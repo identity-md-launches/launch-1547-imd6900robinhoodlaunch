@@ -457,6 +457,59 @@ contract LaunchFeeFailureTest is LaunchFixture {
         assertEq(address(launch).balance, 0);
     }
 
+    /// A payee that refused and was then taken off the list keeps its books: later splits neither pay it nor hand
+    /// its ETH to the new payees, and the timelock's recovery is the only way out of it (cancelling every book).
+    function test_RemovedPayeesBooksAreNeitherResplitNorLostUntilRecovery() public {
+        RefusingReceiver receiver = new RefusingReceiver();
+        _setTwoPayees(address(receiver), users[0], 5000);
+        vm.deal(address(launch), 1 ether);
+        launch.split();
+        assertEq(launch.owed(address(receiver)), 0.5 ether);
+        assertEq(launch.owedTotal(), 0.5 ether);
+        _setTwoPayees(users[1], users[0], 5000); // the refuser is off the list
+        vm.deal(address(launch), 1.5 ether); // 1 ETH new beside the 0.5 booked
+        assertEq(launch.split(), 1 ether, "the booked half is not in anyone else's split");
+        assertEq(users[1].balance, 0.5 ether);
+        assertEq(users[0].balance, 1 ether);
+        assertEq(launch.owed(address(receiver)), 0.5 ether, "still booked to the one off the list");
+        assertEq(address(launch).balance, 0.5 ether, "and still held");
+        assertEq(launch.split(), 0, "nothing new: nothing moves");
+        vm.prank(TIMELOCK);
+        launch.recoverEth(TEAM, 0.5 ether);
+        assertEq(launch.owedTotal(), 0, "recovery cancels the books");
+        assertEq(launch.owed(address(receiver)), 0);
+        assertEq(TEAM.balance, 0.5 ether);
+    }
+
+    /// The same payee listed twice refuses twice: both parts are booked, the total agrees, and when it accepts it
+    /// is paid everything booked plus both of its new parts at once.
+    function test_DuplicateRefusingPayeeBooksEveryPartExactlyOnce() public {
+        ReenterSplitReceiver receiver = new ReenterSplitReceiver(launch); // accepts; refuses while flagged below
+        RefusingReceiver refuser = new RefusingReceiver();
+        address[] memory to = new address[](3);
+        uint16[] memory bps = new uint16[](3);
+        (to[0], bps[0]) = (address(refuser), 4_500);
+        (to[1], bps[1]) = (address(refuser), 4_500);
+        (to[2], bps[2]) = (launch.imdBurn(), 1_000);
+        vm.prank(TIMELOCK);
+        launch.setPayees(to, bps);
+        vm.deal(address(launch), 1 ether);
+        launch.split();
+        assertEq(launch.owed(address(refuser)), 0.9 ether, "both parts booked");
+        assertEq(launch.owedTotal(), 0.9 ether, "counted once each");
+        assertEq(launch.imdBucket(), 0.1 ether);
+        assertEq(address(launch).balance, 1 ether);
+        // the books cannot be split to anyone else, whoever is on the list
+        (to[0], to[1]) = (address(receiver), address(receiver));
+        vm.prank(TIMELOCK);
+        launch.setPayees(to, bps);
+        vm.deal(address(launch), 2 ether);
+        assertEq(launch.split(), 1 ether);
+        assertEq(address(receiver).balance, 0.9 ether, "only the new ETH's 90%");
+        assertEq(launch.owed(address(refuser)), 0.9 ether);
+        assertEq(launch.owedTotal() + launch.imdBucket(), address(launch).balance, "every wei held is spoken for");
+    }
+
     function test_SplitReceiverCannotReenterAndDoubleSpend() public {
         ReenterSplitReceiver receiver = new ReenterSplitReceiver(launch);
         _setTwoPayees(address(receiver), users[0], 5000);
