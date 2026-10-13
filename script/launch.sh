@@ -15,7 +15,8 @@
 #   script/launch.sh direct        launch() now: the coin, the locked pool, the opening buy (BUY_ETH, default 2.81)
 #   script/launch.sh programmable  the Programmable plan for the same launch(): built, packed and preflighted
 #   script/launch.sh submit        creates it on Programmable (their manual review starts), then `review` polls it
-#   script/launch.sh review        the plan's state on Programmable
+#   script/launch.sh review        the plan's state on Programmable, and its price drift (below)
+#   script/launch.sh drift         where the plan's launch lands vs Ethereum's price now: its price is fixed when built
 #   script/launch.sh pot           after the launch, the fees on their way (anyone may do each part): harvest (90% to
 #                                  the pot bridge, 10% set aside for $IMD), burnImd (buys $IMD for IMD's canonical burn
 #                                  executor), bridge (Robinhood -> Across -> Ethereum, from 0.05 ETH), then on Ethereum
@@ -142,6 +143,7 @@ case "${1:-status}" in
     if [ ! -f "$PACKER" ]; then mkdir -p "$(dirname "$PACKER")"; curl -sS -m 120 "$API/custom-launch-contract/request-packer.mjs" -o "$PACKER"; fi
     grep -q "sha256:3cd25308629f932d6a75e4a7694e6bcb67e4471fd2c1782d3b11ba5a7e3f8b61" "$PACKER" || { echo "the packer is for another manifest: refetch it and check the plan"; exit 1; }
     python3 script/params.py --buy "$BUY_ETH" > params.json
+    cp params.json plan-params.json  # the price the plan is built with, for `drift`
     ROBINHOOD_RPC_URL="$RPC" python3 script/programmable_plan.py --launch $LAUNCH --salt $SALT --token $TOKEN --params params.json --excess-to $LAUNCH --out plan.json
     rm -f request.canonical.json pack-report.json
     node "$PACKER" --input "$PWD/plan.json" --out "$PWD/request.canonical.json" --report "$PWD/pack-report.json"
@@ -162,11 +164,24 @@ import json; d=json.load(open('submitted.json')); print(json.dumps({k: d.get(k) 
     ID=$(python3 -c "import json;d=json.load(open('submitted.json'));print(d.get('planId') or d.get('launchId') or d.get('id') or '')")
     [ -n "$ID" ] && save PLAN_ID "$ID"
     ;;
+  drift)
+    [ -f plan-params.json ] || { echo "no plan built yet (programmable)"; exit 1; }
+    python3 script/params.py --buy "$BUY_ETH" > /tmp/params-now.json
+    python3 - <<'PY'
+import json
+plan, now = json.load(open('plan-params.json')), json.load(open('/tmp/params-now.json'))
+lands, target = plan['afterMarketCapEthOn1B'], now['targetMarketCapEthOn1B']
+d = (lands / target - 1) * 100
+print(f"the plan lands at {lands:.3f} ETH market cap (on 1B); Ethereum's price is {target:.3f} now: {d:+.2f}%")
+print("fine: sign it" if abs(d) < 3 else "more than 3% off: a fresh plan (new review) or `direct` lands on today's price")
+PY
+    ;;
   review)
     need PLAN_ID submit
     curl -sS -m 120 "$API/custom-launch-plans/$PLAN_ID" -H "Authorization: Bearer $(key)" -H "Programmable-Launch-Response-Version: 1.2" -o review.json
     python3 -c "
 import json; d=json.load(open('review.json')); print(json.dumps({k: d.get(k) for k in ('status','manualReview','walletUrl','continuation')}, indent=1)[:2000])"
+    "$0" drift || true
     ;;
   pot)
     need LAUNCH deploy
@@ -218,5 +233,5 @@ q=2**96; sq,l,dy=$SQ,$LIQ,$AMOUNT*(1-$FEE/1e6); sq2=sq+dy*q/l; print(int(l*q*(sq
     tx $TL 'executeBatch(address[],uint256[],bytes[],bytes32,bytes32)' "$RECOVER_TARGETS" "$VALUES" "$RECOVER_DATAS" $ZERO $RECOVER_SALT
     echo "back to the team wallet: $(e $(python3 -c "print($(cast balance $TEAM --rpc-url "$RPC") - $B0)")) ETH (less its gas)"
     ;;
-  *) sed -n 2,26p "$0"; exit 1 ;;
+  *) sed -n 2,27p "$0"; exit 1 ;;
 esac
