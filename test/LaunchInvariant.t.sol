@@ -59,6 +59,9 @@ contract LaunchSequenceHandler is Test {
     uint256 public migrationsExecuted;
     uint256 public refusalsBooked;
     uint256 public booksCancelled;
+    uint256 public booksDropped;
+    uint256 public booksOfferedAlone;
+    uint256 public burnsExecuted;
     uint256 internal constant MARGIN = 1_000;
     /// the refusing payee, and every address the split can book ETH to while it runs
     TogglePayee public immutable refuser = new TogglePayee();
@@ -86,8 +89,25 @@ contract LaunchSequenceHandler is Test {
     }
 
     /// The split's payees: the defaults, or a list with the refusing payee in it (a plain EOA beside it). The $IMD
-    /// burn executor keeps its 10% in every list, as the real split does.
+    /// burn executor keeps its 10% in every list, as the real split does. A list that drops the refuser cancels
+    /// its books (the ETH is the next split's); one that keeps it leaves them exactly as they were.
     function configurePayees(uint8 mode) external {
+        uint256 owedBefore = launch.owedTotal();
+        uint256 refuserOwed = launch.owed(address(refuser));
+        uint256 held = address(launch).balance;
+        _setPayees(mode);
+        assertEq(address(launch).balance, held, "a list change moves no ETH");
+        if (mode % 3 == 0) {
+            assertEq(launch.owed(address(refuser)), 0, "dropped from the list: its books are cancelled");
+            assertEq(launch.owedTotal(), owedBefore - refuserOwed);
+            if (refuserOwed != 0) ++booksDropped;
+        } else {
+            assertEq(launch.owed(address(refuser)), refuserOwed, "kept on the list: its books stand");
+            assertEq(launch.owedTotal(), owedBefore);
+        }
+    }
+
+    function _setPayees(uint8 mode) internal {
         vm.startPrank(timelock);
         if (mode % 3 == 0) {
             address[] memory to = new address[](2);
@@ -132,14 +152,17 @@ contract LaunchSequenceHandler is Test {
         uint256 amount = launch.split();
         assertEq(amount, balance - bucket - owedBefore, "the split is what is neither reserved nor booked");
         uint256 part = amount * refuserBps / 10_000;
-        if (amount == 0) {
-            // split returns before the payee loop when there is nothing new: what is booked is not offered until
-            // new ETH arrives (reported in .imd-findings.json as a liveness nit, not asserted correct here)
+        if (amount == 0 && owedBefore == 0) {
+            // nothing new and nothing booked: the split returns before the payee loop
             assertEq(launch.owed(address(refuser)), refuserOwed);
             assertEq(address(refuser).balance, refuserBalance);
         } else if (refuserBps == 0) {
-            assertEq(launch.owed(address(refuser)), refuserOwed, "a payee off the list is neither paid nor booked");
+            // a dropped payee's books were cancelled by the list change, so there is nothing to offer it
+            assertEq(refuserOwed, 0, "nothing is booked to a payee off the list");
+            assertEq(launch.owed(address(refuser)), 0);
+            assertEq(address(refuser).balance, refuserBalance);
         } else if (refuser.refusing()) {
+            if (part == 0 && refuserOwed != 0) ++booksOfferedAlone; // nothing new for it: the books alone
             if (part + refuserOwed != 0) {
                 assertEq(launch.owed(address(refuser)), refuserOwed + part, "the refused part joins the books");
                 assertEq(address(refuser).balance, refuserBalance);
@@ -384,23 +407,72 @@ contract LaunchSequenceHandler is Test {
         ghostBurned += amount;
     }
 
+    /// The burn's keeper: the owner until the timelock names one (zero names the owner again). Only the timelock.
+    function setKeeper(uint8 seed) external {
+        address next = seed % 4 == 3 ? address(0) : actors[seed % 4];
+        vm.prank(actors[(uint256(seed) + 1) % 3]);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotTimelock.selector);
+        launch.setImdKeeper(next);
+        vm.prank(team);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotTimelock.selector);
+        launch.setImdKeeper(next);
+        vm.prank(timelock);
+        launch.setImdKeeper(next);
+        assertEq(launch.imdKeeper(), next);
+    }
+
+    function keeper() public view returns (address k) {
+        k = launch.imdKeeper();
+        if (k == address(0)) k = launch.owner();
+    }
+
+    /// Only the keeper buys; it spends at most IMD_BUY_MAX of the bucket, once per block, and its floor is the one
+    /// price protection: a floor above what the pool gives reverts the whole buy, bucket and all.
     function burnImd(bool nextBlock) external {
         uint256 currentBlock = vm.getBlockNumber();
         if (nextBlock) vm.roll(++currentBlock);
         uint256 bucket = launch.imdBucket();
+        address k = keeper();
+        // whoever is not the keeper is refused first, whatever the block or the bucket
+        address stranger = k == actors[2] ? actors[1] : actors[2];
+        vm.prank(stranger);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotKeeper.selector);
+        launch.burnImd(0);
+        if (k != timelock) {
+            vm.prank(timelock);
+            vm.expectRevert(IMD6900RobinhoodLaunch.NotKeeper.selector);
+            launch.burnImd(0);
+        }
         if (currentBlock < launch.nextImdBurnBlock()) {
+            vm.prank(k);
             vm.expectRevert(IMD6900RobinhoodLaunch.BurnRateLimited.selector);
             launch.burnImd(0);
             return;
         }
-        if (bucket == 0) return;
+        if (bucket == 0) {
+            vm.prank(k);
+            vm.expectRevert(IMD6900RobinhoodLaunch.NoEth.selector);
+            launch.burnImd(0);
+            return;
+        }
         uint256 balance = address(launch).balance;
         uint256 beforeImd = MockImdstr(launch.IMD()).balanceOf(launch.imdBurn());
+        // a floor nobody can meet: the buy is rolled back whole, the bucket and the block's slot untouched
+        vm.prank(k);
+        vm.expectPartialRevert(IMD6900RobinhoodLaunch.Short.selector);
+        launch.burnImd(type(uint256).max);
+        assertEq(launch.imdBucket(), bucket, "a short buy keeps every wei reserved");
+        assertEq(address(launch).balance, balance);
+        vm.prank(k);
         uint256 bought = launch.burnImd(0);
+        ++burnsExecuted;
         ghostImdDelivered += bought;
         assertEq(MockImdstr(launch.IMD()).balanceOf(launch.imdBurn()) - beforeImd, bought);
         assertEq(balance - address(launch).balance, bucket - launch.imdBucket());
         assertLe(bucket - launch.imdBucket(), launch.IMD_BUY_MAX());
+        assertEq(bucket - launch.imdBucket(), bucket < launch.IMD_BUY_MAX() ? bucket : launch.IMD_BUY_MAX());
+        assertEq(launch.nextImdBurnBlock(), currentBlock + 1);
+        vm.prank(k);
         vm.expectRevert(IMD6900RobinhoodLaunch.BurnRateLimited.selector);
         launch.burnImd(0);
     }
@@ -466,6 +538,15 @@ contract LaunchSequenceHandler is Test {
             locked.feeRefund(actor);
         }
         vm.stopPrank();
+        // the keeper is the timelock's to name, and the burn is the keeper's alone
+        vm.prank(actor);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotTimelock.selector);
+        launch.setImdKeeper(actor);
+        if (actor != keeper()) {
+            vm.prank(actor);
+            vm.expectRevert(IMD6900RobinhoodLaunch.NotKeeper.selector);
+            launch.burnImd(0);
+        }
         // the owner cannot walk away from the claims, and the timelock cannot "release" held coins to the launch itself
         vm.prank(team);
         vm.expectRevert(IMD6900RobinhoodLaunch.NoRenounce.selector);
@@ -549,10 +630,11 @@ contract LaunchInvariantTest is LaunchFixture {
         }
         initialLiquidity = locked.liquidity();
 
-        bytes4[] memory selectors = new bytes4[](24);
+        bytes4[] memory selectors = new bytes4[](25);
         selectors[21] = handler.configurePayees.selector;
         selectors[22] = handler.toggleRefusal.selector;
         selectors[23] = handler.splitChecked.selector;
+        selectors[24] = handler.setKeeper.selector;
         selectors[0] = handler.claim.selector;
         selectors[1] = handler.trade.selector;
         selectors[2] = handler.refundedTrade.selector;
@@ -633,6 +715,32 @@ contract LaunchInvariantTest is LaunchFixture {
         assertLe(launch.owedTotal() + launch.imdBucket(), address(launch).balance, "booked and reserved ETH is held");
         assertEq(launch.owed(launch.imdBurn()), 0, "the burn's share is reserved, never booked");
         assertEq(launch.owner(), TEAM, "the owner never changes nor renounces");
+        // books belong only to payees on the current list: a drop cancels them the moment it is made
+        (address[] memory listed,) = launch.payees();
+        for (uint256 i; i < 3; ++i) {
+            address p = handler.payeesSeen(i);
+            if (launch.owed(p) == 0) continue;
+            bool onList;
+            for (uint256 j; j < listed.length && !onList; ++j) {
+                onList = listed[j] == p;
+            }
+            assertTrue(onList, "nothing stays booked to a payee off the list");
+        }
+    }
+
+    /// The $IMD buys are the keeper's alone, and the keeper is whoever the timelock last named (the owner by
+    /// default); the executor they buy for is never a stranger to the split's reserve.
+    function invariant_BurnIsTheKeepersAlone() public {
+        address k = handler.keeper();
+        assertEq(k, launch.imdKeeper() == address(0) ? TEAM : launch.imdKeeper());
+        address stranger = k == users[0] ? users[1] : users[0];
+        vm.prank(stranger);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotKeeper.selector);
+        launch.burnImd(0);
+        vm.prank(TIMELOCK);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotKeeper.selector);
+        launch.burnImd(0);
+        assertEq(launch.imdBurned(), handler.ghostImdDelivered());
     }
 
     /// Principal remains a v4 position owned only by the locked pool, including
@@ -682,8 +790,19 @@ contract LaunchInvariantTest is LaunchFixture {
         handler.splitChecked(); // paid all of it
         handler.toggleRefusal(true);
         handler.donateEth(1 ether, false);
-        handler.splitChecked();
+        handler.splitChecked(); // booked again
+        handler.splitChecked(); // nothing new: the books alone are offered, and refused again
+        handler.donateEth(1 ether, false);
+        handler.configurePayees(2); // the refuser kept, with a new share: its books stand
+        handler.splitChecked(); // the new part joins them
         handler.recoverEth(type(uint256).max); // all of it: the books are cancelled, the bucket emptied
+        handler.donateEth(1 ether, false);
+        handler.splitChecked(); // booked once more
+        handler.configurePayees(0); // dropped from the list: cancelled, the ETH the next split's
+        handler.splitChecked(); // which divides it among the defaults
+        handler.setKeeper(1); // the timelock names a keeper
+        handler.burnImd(true); // who buys 0.1 ETH of $IMD
+        handler.burnImd(true); // and the rest the next block
         handler.releaseLegacy(50 ether);
         handler.sellHeld(100 ether);
         handler.releaseExcess(100 ether, true);
@@ -694,13 +813,18 @@ contract LaunchInvariantTest is LaunchFixture {
         invariant_ValueIsConservedAndOnlyExplicitBurnsReduceSupply();
         invariant_LiquidityStaysLockedAndRetiredPoolsStayEmpty();
         invariant_RefusedSharesStayBookedAndBacked();
+        invariant_BurnIsTheKeepersAlone();
         assertGt(handler.claimsExecuted(), 0);
         assertGt(handler.tradesExecuted(), 0);
         assertGt(handler.refundsExecuted(), 0);
         assertGt(handler.collectionsExecuted(), 0);
         assertGt(handler.migrationsExecuted(), 0);
-        assertEq(handler.refusalsBooked(), 3);
+        assertEq(handler.burnsExecuted(), 3);
+        assertEq(handler.refusalsBooked(), 5);
+        assertEq(handler.booksOfferedAlone(), 1);
         assertEq(handler.booksCancelled(), 1);
+        assertEq(handler.booksDropped(), 1);
+        assertEq(launch.imdKeeper(), users[1]);
         assertEq(launch.owedTotal(), 0);
         assertEq(launch.imdBucket(), 0);
     }

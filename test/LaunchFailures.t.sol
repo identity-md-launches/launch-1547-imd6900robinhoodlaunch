@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import {Vm} from "forge-std/Vm.sol";
 import {LaunchFixture} from "./helpers/LaunchFixture.sol";
 import {IMD6900RobinhoodLaunch} from "src/IMD6900RobinhoodLaunch.sol";
 import {IMD6900LockedPool} from "src/IMD6900LockedPool.sol";
@@ -54,8 +55,20 @@ contract LaunchPreconditionTest is LaunchFixture {
         locked.lowerFee(33_300);
         vm.expectRevert(IMD6900LockedPool.NotOpen.selector);
         locked.collect();
+        // the burn is the keeper's (the owner until the timelock names one): everyone else is refused before the
+        // empty bucket is even looked at, and the owner finds it empty
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotKeeper.selector);
+        launch.burnImd(0);
+        vm.prank(TIMELOCK);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotKeeper.selector);
+        launch.burnImd(0);
+        vm.prank(TEAM);
         vm.expectRevert(IMD6900RobinhoodLaunch.NoEth.selector);
         launch.burnImd(0);
+        vm.prank(TEAM);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotTimelock.selector);
+        launch.setImdKeeper(TEAM);
+        assertEq(launch.imdKeeper(), address(0));
         assertEq(launch.claimedTotal(), 0);
     }
 
@@ -457,23 +470,60 @@ contract LaunchFeeFailureTest is LaunchFixture {
         assertEq(address(launch).balance, 0);
     }
 
-    /// A payee that refused and was then taken off the list keeps its books: later splits neither pay it nor hand
-    /// its ETH to the new payees, and the timelock's recovery is the only way out of it (cancelling every book).
-    function test_RemovedPayeesBooksAreNeitherResplitNorLostUntilRecovery() public {
+    /// A payee that refused keeps its books while it stays listed (no other payee's split ever includes them, and
+    /// a split with nothing new offers the books alone); the moment the timelock drops it from the list its books
+    /// are cancelled, and the next split divides that ETH among the new payees.
+    function test_RemovedPayeesBooksAreCancelledAndResplitKeptOnesAreNot() public {
         RefusingReceiver receiver = new RefusingReceiver();
         _setTwoPayees(address(receiver), users[0], 5000);
         vm.deal(address(launch), 1 ether);
         launch.split();
         assertEq(launch.owed(address(receiver)), 0.5 ether);
         assertEq(launch.owedTotal(), 0.5 ether);
-        _setTwoPayees(users[1], users[0], 5000); // the refuser is off the list
-        vm.deal(address(launch), 1.5 ether); // 1 ETH new beside the 0.5 booked
-        assertEq(launch.split(), 1 ether, "the booked half is not in anyone else's split");
-        assertEq(users[1].balance, 0.5 ether);
-        assertEq(users[0].balance, 1 ether);
-        assertEq(launch.owed(address(receiver)), 0.5 ether, "still booked to the one off the list");
+        // still listed, with a new share: nothing new to split offers the books alone, and it refuses again
+        _setTwoPayees(users[0], address(receiver), 7_500);
+        assertEq(launch.owed(address(receiver)), 0.5 ether, "kept on the list: the books stand");
+        assertEq(launch.owedTotal(), 0.5 ether);
+        vm.expectEmit(true, true, true, true);
+        emit IMD6900RobinhoodLaunch.PayFailed(address(receiver), 0.5 ether);
+        assertEq(launch.split(), 0, "nothing new, but the books are offered");
+        assertEq(launch.owed(address(receiver)), 0.5 ether);
         assertEq(address(launch).balance, 0.5 ether, "and still held");
-        assertEq(launch.split(), 0, "nothing new: nothing moves");
+        // new ETH beside the books: the books are not in anyone else's split
+        vm.deal(address(launch), 1.5 ether);
+        assertEq(launch.split(), 1 ether, "the booked half is not in anyone else's split");
+        assertEq(users[0].balance, 0.5 ether + 0.75 ether);
+        assertEq(launch.owed(address(receiver)), 0.5 ether + 0.25 ether, "the new quarter joins the books");
+        assertEq(launch.owedTotal(), 0.75 ether);
+        // dropped from the list: the books are cancelled and the ETH is the next split's
+        vm.expectEmit(true, true, true, true);
+        emit IMD6900RobinhoodLaunch.OwedCancelled(0.75 ether);
+        _setTwoPayees(users[1], users[0], 5000);
+        assertEq(launch.owed(address(receiver)), 0, "off the list: the books are cancelled");
+        assertEq(launch.owedTotal(), 0);
+        assertEq(address(launch).balance, 0.75 ether, "the ETH stays until the next split");
+        assertEq(launch.split(), 0.75 ether, "the cancelled books are divided again, among the new payees");
+        assertEq(users[1].balance, 0.375 ether);
+        assertEq(users[0].balance, 1.25 ether + 0.375 ether);
+        assertEq(address(launch).balance, 0);
+        assertEq(address(receiver).balance, 0, "the refuser never got a wei");
+    }
+
+    /// Drops that cancel nothing: a list change that keeps every booked payee, or drops one with no books, leaves
+    /// the books and the total exactly as they were, and recovery still cancels what remains.
+    function test_ListChangesWithoutDropsLeaveTheBooksAlone() public {
+        RefusingReceiver receiver = new RefusingReceiver();
+        _setTwoPayees(address(receiver), users[0], 5000);
+        vm.deal(address(launch), 1 ether);
+        launch.split();
+        assertEq(launch.owedTotal(), 0.5 ether);
+        // the same list again, and the other payee swapped for a third: the refuser is kept each time
+        _setTwoPayees(address(receiver), users[0], 5000);
+        assertEq(launch.owed(address(receiver)), 0.5 ether);
+        _setTwoPayees(address(receiver), users[1], 2_500);
+        assertEq(launch.owed(address(receiver)), 0.5 ether);
+        assertEq(launch.owedTotal(), 0.5 ether);
+        assertEq(address(launch).balance, 0.5 ether);
         vm.prank(TIMELOCK);
         launch.recoverEth(TEAM, 0.5 ether);
         assertEq(launch.owedTotal(), 0, "recovery cancels the books");
@@ -481,8 +531,9 @@ contract LaunchFeeFailureTest is LaunchFixture {
         assertEq(TEAM.balance, 0.5 ether);
     }
 
-    /// The same payee listed twice refuses twice: both parts are booked, the total agrees, and when it accepts it
-    /// is paid everything booked plus both of its new parts at once.
+    /// The same payee listed twice refuses twice: both parts are booked, the total agrees, a later split with it
+    /// still listed books its new parts on top and pays the other payee only its own; and when the list drops the
+    /// duplicate, its books are cancelled exactly once (the second old entry finds nothing) and resplit.
     function test_DuplicateRefusingPayeeBooksEveryPartExactlyOnce() public {
         ReenterSplitReceiver receiver = new ReenterSplitReceiver(launch); // accepts; refuses while flagged below
         RefusingReceiver refuser = new RefusingReceiver();
@@ -499,15 +550,38 @@ contract LaunchFeeFailureTest is LaunchFixture {
         assertEq(launch.owedTotal(), 0.9 ether, "counted once each");
         assertEq(launch.imdBucket(), 0.1 ether);
         assertEq(address(launch).balance, 1 ether);
-        // the books cannot be split to anyone else, whoever is on the list
-        (to[0], to[1]) = (address(receiver), address(receiver));
+        // still listed beside an accepting payee: the books are not in the other's split
+        to[1] = address(receiver);
         vm.prank(TIMELOCK);
         launch.setPayees(to, bps);
+        assertEq(launch.owed(address(refuser)), 0.9 ether, "kept on the list");
         vm.deal(address(launch), 2 ether);
         assertEq(launch.split(), 1 ether);
-        assertEq(address(receiver).balance, 0.9 ether, "only the new ETH's 90%");
-        assertEq(launch.owed(address(refuser)), 0.9 ether);
+        assertEq(address(receiver).balance, 0.45 ether, "only the new ETH's 45%");
+        assertEq(launch.owed(address(refuser)), 0.9 ether + 0.45 ether, "the new part joins the books");
+        assertEq(launch.imdBucket(), 0.2 ether);
         assertEq(launch.owedTotal() + launch.imdBucket(), address(launch).balance, "every wei held is spoken for");
+        // off the list (both of its old entries): cancelled once, and resplit to the accepting payee twice over
+        (to[0], to[1]) = (address(receiver), address(receiver));
+        vm.prank(TIMELOCK);
+        vm.recordLogs();
+        launch.setPayees(to, bps);
+        uint256 cancellations;
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics[0] == IMD6900RobinhoodLaunch.OwedCancelled.selector) {
+                ++cancellations;
+                assertEq(abi.decode(logs[i].data, (uint256)), 1.35 ether);
+            }
+        }
+        assertEq(cancellations, 1, "the duplicate old entry finds nothing left to cancel");
+        assertEq(launch.owed(address(refuser)), 0);
+        assertEq(launch.owedTotal(), 0);
+        assertEq(launch.split(), 1.35 ether);
+        assertEq(address(receiver).balance, 0.45 ether + 1.215 ether);
+        assertEq(launch.imdBucket(), 0.2 ether + 0.135 ether);
+        assertEq(launch.imdBucket(), address(launch).balance);
+        assertEq(address(refuser).balance, 0);
     }
 
     function test_SplitReceiverCannotReenterAndDoubleSpend() public {
